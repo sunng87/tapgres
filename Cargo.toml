@@ -1,0 +1,21 @@
+[package]
+name = "pgwiretap"
+version = "0.1.0"
+edition = "2024"
+authors = ["Ning Sun <sunng@pm.me>"]
+license = "MIT"
+description = "Monitor a local PostgreSQL port and decode its wire traffic to stdout"
+keywords = ["postgres", "postgresql", "pgwire", "pcap", "network"]
+categories = ["command-line-utilities", "database", "network-programming"]
+homepage = "https://github.com/sunng87/pgwiretap"
+repository = "https://github.com/sunng87/pgwiretap"
+readme = "README.md"
+rust-version = "1.85"
+
+[dependencies]
+# Protocol-layer only: gives us the `messages` module for decoding.
+pgwire = { version = "0.40", default-features = false }
+pcap = "2.4"
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
