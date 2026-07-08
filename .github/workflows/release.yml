@@ -1,0 +1,53 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v27
+        with:
+          nix_path: nixpkgs=channel:nixpkgs-unstable
+
+      - name: Build binary
+        run: nix build --print-build-logs
+
+      - name: Copy binary
+        run: cp result/bin/tapgres tapgres-linux-x86_64
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: tapgres-linux-x86_64
+          name: Release ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Get SHA256 checksum
+        id: sha256
+        run: echo "sha256=$(sha256sum tapgres-linux-x86_64 | awk '{print $1}')" >> $GITHUB_OUTPUT
+
+      - name: Update PKGBUILD
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          sed -i "s/^pkgver=.*/pkgver=$version/" PKGBUILD
+          sed -i "s/^sha256sums=.*/sha256sums=('${{ steps.sha256.outputs.sha256 }}')/" PKGBUILD
+
+      - name: Deploy to AUR
+        uses: KSXGitHub/github-actions-deploy-aur@v4.1.1
+        with:
+          pkgname: tapgres-bin
+          pkgbuild: ./PKGBUILD
+          commit_username: sunng
+          commit_email: n@sunng.info
+          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
