@@ -21,9 +21,9 @@ use pgwire::messages::startup::{
     Authentication, BackendKeyData, GssEncRequest, ParameterStatus, SecretKey, SslRequest, Startup,
 };
 
-use pgwiretap::decode;
-use pgwiretap::flow::ConnTable;
-use pgwiretap::net::TcpSegment;
+use tapgres::decode;
+use tapgres::flow::ConnTable;
+use tapgres::net::TcpSegment;
 
 const CLI: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
 const SRV: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));

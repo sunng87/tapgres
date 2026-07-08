@@ -1,4 +1,4 @@
-//! pgwiretap — passive PostgreSQL wire-protocol monitor.
+//! tapgres — passive PostgreSQL wire-protocol monitor.
 //!
 //! Captures TCP traffic on a user-specified local PostgreSQL port using
 //! libpcap, reassembles each connection's two byte streams, and decodes them
@@ -13,13 +13,13 @@ use std::error::Error;
 use clap::Parser;
 use pcap::{Capture, Device};
 
-use pgwiretap::{flow, net};
+use tapgres::{flow, net};
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "pgwiretap",
+    name = "tapgres",
     version,
-    about = "Monitor a local PostgreSQL port and decode pgwire traffic to stdout"
+    about = "Passively tap a local PostgreSQL port and decode its wire traffic to stdout"
 )]
 struct Args {
     /// PostgreSQL TCP port to monitor.
@@ -46,11 +46,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     let device = resolve_device(args.interface.as_deref())?;
 
     eprintln!(
-        "pgwiretap: capturing on '{}'  (filter: tcp port {})",
+        "tapgres: capturing on '{}'  (filter: tcp port {})",
         device.name, args.port
     );
     eprintln!(
-        "pgwiretap: note — only cleartext connections are decoded; run as root / grant CAP_NET_RAW."
+        "tapgres: note — only cleartext connections are decoded; run as root / grant CAP_NET_RAW."
     );
 
     let mut cap = Capture::from_device(device)?
@@ -61,11 +61,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     cap.filter(&format!("tcp port {}", args.port), true)?;
 
     let dlt = cap.get_datalink().0;
-    eprintln!(
-        "pgwiretap: datalink type = {} ({})",
-        dlt,
-        datalink_name(dlt)
-    );
+    eprintln!("tapgres: datalink type = {} ({})", dlt, datalink_name(dlt));
 
     let mut table = flow::ConnTable::new();
     loop {

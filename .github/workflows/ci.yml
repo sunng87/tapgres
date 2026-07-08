@@ -52,4 +52,4 @@ jobs:
         run: nix flake check --no-build
 
       - name: smoke test
-        run: ./result/bin/pgwiretap --help
+        run: ./result/bin/tapgres --help

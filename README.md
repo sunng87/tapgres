@@ -1,8 +1,8 @@
-# pgwiretap
+# tapgres
 
-Passively monitor a local PostgreSQL port and decode its wire traffic to stdout.
+Passively tap a local PostgreSQL port and decode its wire traffic to stdout.
 
-`pgwiretap` captures TCP traffic with libpcap, reassembles each connection, and
+`tapgres` captures TCP traffic with libpcap, reassembles each connection, and
 decodes it with the [`pgwire`](https://crates.io/crates/pgwire) protocol layer.
 
 > Cleartext connections only. If SSL/GSS is negotiated and accepted, the stream
@@ -28,23 +28,23 @@ decodes it with the [`pgwire`](https://crates.io/crates/pgwire) protocol layer.
 ## Usage
 
 ```
-pgwiretap -p 5432                 # monitor port 5432 on loopback (default)
-pgwiretap -p 5432 -i eth0         # capture on a specific interface
-pgwiretap -p 5432 -i any          # capture on all interfaces
-pgwiretap --help                  # all options
+tapgres -p 5432                 # monitor port 5432 on loopback (default)
+tapgres -p 5432 -i eth0         # capture on a specific interface
+tapgres -p 5432 -i any          # capture on all interfaces
+tapgres --help                  # all options
 ```
 
 Capturing requires privileges (`CAP_NET_RAW` or root):
 
 ```sh
-sudo setcap cap_net_raw+ep $(which pgwiretap)
+sudo setcap cap_net_raw+ep $(which tapgres)
 ```
 
 ## Install
 
 ```sh
 # Nix
-nix build && ./result/bin/pgwiretap -p 5432
+nix build && ./result/bin/tapgres -p 5432
 
 # Cargo (libpcap must be installed, e.g. libpcap-dev on Debian/Ubuntu)
 cargo install --path .

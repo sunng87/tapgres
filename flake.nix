@@ -1,5 +1,5 @@
 {
-  description = "Monitor a local PostgreSQL port and decode its wire traffic to stdout";
+  description = "Passively tap a local PostgreSQL port and decode its wire traffic to stdout";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
@@ -28,13 +28,13 @@
         ];
         craneLib' = craneLib.overrideToolchain rustToolchain;
 
-        # pgwiretap's only native dependency is libpcap. Its nixpkgs split
+        # tapgres's only native dependency is libpcap. Its nixpkgs split
         # output puts the headers in `out` and the shared library in `lib`, so
         # we need both for compile-time and runtime.
         nativeBuildInputs = with pkgs; [ pkg-config ];
         buildInputs = with pkgs; [ libpcap libpcap.lib ];
 
-        pgwiretap = craneLib'.buildPackage {
+        tapgres = craneLib'.buildPackage {
           src = craneLib'.cleanCargoSource ./.;
           strictDeps = true;
           inherit nativeBuildInputs buildInputs;
@@ -47,13 +47,13 @@
 
       in
       {
-        packages.default = pgwiretap;
-        packages.pgwiretap = pgwiretap;
+        packages.default = tapgres;
+        packages.tapgres = tapgres;
 
-        checks.default = pgwiretap;
+        checks.default = tapgres;
 
         # --- dev environment ---
-        # Only what pgwiretap needs: the Rust toolchain, a C linker, and
+        # Only what tapgres needs: the Rust toolchain, a C linker, and
         # libpcap. A local postgres is included so you have something to point
         # the tap at during development.
         devShells.default = pkgs.mkShell {
