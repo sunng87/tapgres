@@ -3,7 +3,9 @@
 //! `main.rs` (the binary) wires these together with libpcap; the integration
 //! tests exercise them directly.
 
+pub mod capture;
 pub mod decode;
 pub mod flow;
 pub mod net;
 pub mod proxy;
+pub mod tui;

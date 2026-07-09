@@ -1,9 +1,10 @@
 # tapgres
 
-Tap a local PostgreSQL connection and decode its wire traffic to stdout.
+Tap a local PostgreSQL connection and decode its wire traffic.
 
 `tapgres` reassembles each connection and decodes it with the
-[`pgwire`](https://crates.io/crates/pgwire) protocol layer. It has two modes:
+[`pgwire`](https://crates.io/crates/pgwire) protocol layer. It has two traffic
+sources, selected with `--mode`, and an optional interactive view with `--tui`:
 
 - **`pcap`** (default): passively captures traffic on a port with libpcap.
   Cleartext only — if SSL/GSS is negotiated and accepted the stream goes opaque
@@ -11,6 +12,8 @@ Tap a local PostgreSQL connection and decode its wire traffic to stdout.
 - **`mitm`**: runs a local TLS-terminating proxy so you can decode **encrypted**
   sessions too. Point your client at the proxy; it decrypts the client leg,
   decodes in the middle, and forwards to the real server.
+- **`--tui`**: render either source as an interactive, scrollable, filterable
+  full-screen view instead of line-oriented stdout.
 
 `F→B` is the client (frontend) → server (backend); `B→F` is the reverse.
 
@@ -78,6 +81,31 @@ the upstream certificate — it assumes a local, operator-controlled server.
 
 > GSS encryption is refused (the client falls back); cancel requests are
 > relayed verbatim.
+
+## Interactive TUI (`--tui`)
+
+Add `--tui` to either mode for a full-screen, scrollable, filterable view
+instead of line-oriented stdout. The chosen source runs in a background thread
+and feeds the TUI on the main thread:
+
+```
+tapgres --tui                              # pcap source, interactive view
+tapgres --mode mitm --tui                  # TLS proxy source, interactive view
+```
+
+Keybindings:
+
+| Key | Action |
+| --- | ------ |
+| `q` / `Ctrl-C` | quit |
+| `j`/`k`, arrows, `PgUp`/`PgDn` | scroll |
+| `g` / `G` | top / bottom |
+| `f` | toggle follow (auto-tail) |
+| `/` | filter by substring (`Enter` applies, `Esc` cancels) |
+| `c` | clear |
+
+Lines are coloured by direction (`F→B` cyan, `B→F` grey; connection notices
+yellow; warnings red). `--tui` with `pcap` still needs capture privileges.
 
 ## Install
 

@@ -6,7 +6,9 @@
 //! advances the SSL / startup state machine (see `DecodeContext`).
 
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::fmt::Write as _;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use bytes::{Buf, Bytes};
 use chrono::Local;
@@ -56,14 +58,75 @@ thread_local! {
     static CAPTURE: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
 }
 
-/// Emit one decoded line of output. When a test capture is active, lines are
-/// buffered instead of printed.
+/// Cap on how many lines a [`SharedSink`] keeps, so the TUI's memory stays
+/// bounded during long captures.
+const SINK_CAP: usize = 50_000;
+
+/// A thread-safe buffer of decoded lines. When installed in [`SHARED_SINK`],
+/// [`out`] appends here instead of printing — this is how the TUI collects
+/// events from the (possibly multi-threaded) pcap/mitm source.
+pub struct SharedSink {
+    lines: Mutex<VecDeque<String>>,
+}
+
+impl SharedSink {
+    pub fn new() -> Self {
+        Self {
+            lines: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    pub fn push(&self, line: String) {
+        let mut g = self.lines.lock().unwrap();
+        if g.len() >= SINK_CAP {
+            g.pop_front();
+        }
+        g.push_back(line);
+    }
+
+    /// Append everything currently buffered into `out_vec`.
+    pub fn drain_into(&self, out_vec: &mut Vec<String>) {
+        let mut g = self.lines.lock().unwrap();
+        for line in g.drain(..) {
+            out_vec.push(line);
+        }
+    }
+}
+
+impl Default for SharedSink {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// When set, all decoded lines (and [`status`] messages) go here instead of to
+/// stdout/stderr. Installed by the TUI; left unset by the plain stdout path.
+pub static SHARED_SINK: OnceLock<Arc<SharedSink>> = OnceLock::new();
+
+/// Emit one decoded line of output. When a shared sink is installed (TUI mode)
+/// the line goes there; when a test capture is active it is buffered; otherwise
+/// it is printed to stdout.
 pub fn out(line: String) {
+    if let Some(sink) = SHARED_SINK.get() {
+        sink.push(line);
+        return;
+    }
     let buffered = CAPTURE.with(|c| c.borrow().is_some());
     if buffered {
         CAPTURE.with(|c| c.borrow_mut().as_mut().unwrap().push(line));
     } else {
         println!("{line}");
+    }
+}
+
+/// Emit a status/informational line. With a shared sink installed (TUI) it
+/// appears in the TUI; otherwise it goes to stderr — the original behaviour
+/// for the pcap/mitm stdout paths.
+pub fn status(msg: String) {
+    if let Some(sink) = SHARED_SINK.get() {
+        sink.push(msg);
+    } else {
+        eprintln!("{msg}");
     }
 }
 

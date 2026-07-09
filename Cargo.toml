@@ -20,6 +20,10 @@ bytes = "1"
 clap = { version = "4", features = ["derive"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
+# --- TUI (`--tui`) ---
+# ratatui re-exports crossterm (its default backend), so we use that for events.
+ratatui = "0.30"
+
 # --- MITM proxy mode (`--mode mitm`) ---
 # tokio drives the per-connection relay; tokio-rustls terminates TLS on the
 # client leg and (optionally) re-encrypts on the upstream leg.

@@ -71,25 +71,26 @@ pub fn run(opts: ProxyOpts) -> Result<(), Box<dyn Error>> {
     rt.block_on(serve(opts))
 }
 
-async fn serve(opts: ProxyOpts) -> Result<(), Box<dyn Error>> {
+pub async fn serve(opts: ProxyOpts) -> Result<(), Box<dyn Error>> {
     let tls = Arc::new(materialize_tls(&opts)?);
 
     match &tls.ca_cert_path {
         Some(ca) => {
-            eprintln!("tapgres: generated/loaded CA at {}", ca.display());
-            eprintln!(
+            decode::status(format!("tapgres: generated/loaded CA at {}", ca.display()));
+            decode::status(
                 "tapgres: for clients to trust this proxy, install the CA, e.g. for libpq/psql:"
+                    .into(),
             );
-            eprintln!("  cp {} ~/.postgresql/root.crt", ca.display());
+            decode::status(format!("  cp {} ~/.postgresql/root.crt", ca.display()));
         }
         None if opts.tls_cert.is_some() => {
-            eprintln!("tapgres: using user-supplied TLS certificate");
+            decode::status("tapgres: using user-supplied TLS certificate".into());
         }
         _ => {}
     }
 
     let listener = TcpListener::bind(&opts.listen).await?;
-    eprintln!(
+    decode::status(format!(
         "tapgres: mitm proxy  {}  ->  {}  (client TLS termination{})",
         opts.listen,
         opts.upstream,
@@ -98,7 +99,7 @@ async fn serve(opts: ProxyOpts) -> Result<(), Box<dyn Error>> {
         } else {
             ", upstream TLS auto-negotiate"
         }
-    );
+    ));
 
     let opts = Arc::new(opts);
     loop {
@@ -107,7 +108,7 @@ async fn serve(opts: ProxyOpts) -> Result<(), Box<dyn Error>> {
         let tls = tls.clone();
         tokio::spawn(async move {
             if let Err(e) = handle_connection(client, opts, tls).await {
-                eprintln!("tapgres: connection from {peer}: {e}");
+                decode::status(format!("tapgres: connection from {peer}: {e}"));
             }
         });
     }
@@ -297,10 +298,10 @@ fn materialize_tls(opts: &ProxyOpts) -> Result<TlsMaterial, Box<dyn Error>> {
             if !(ca.exists() && leaf.exists() && leaf_key.exists()) {
                 fs::create_dir_all(dir)?;
                 generate_ca_and_leaf(dir)?;
-                eprintln!(
+                decode::status(format!(
                     "tapgres: generated CA + server certificate in {}",
                     dir.display()
-                );
+                ));
             }
             (load_pem_certs(&leaf)?, load_pem_key(&leaf_key)?, Some(ca))
         }
