@@ -23,6 +23,9 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # --- TUI (`--tui`) ---
 # ratatui re-exports crossterm (its default backend), so we use that for events.
 ratatui = "0.30"
+# crossbeam-channel carries decoded lines from the (possibly multi-threaded)
+# source to the output consumer (stdout-printer thread or the TUI).
+crossbeam-channel = "0.5"
 
 # --- MITM proxy mode (`--mode mitm`) ---
 # tokio drives the per-connection relay; tokio-rustls terminates TLS on the

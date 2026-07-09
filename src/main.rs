@@ -16,11 +16,12 @@
 //! instead of line-oriented stdout. See [`tapgres::tui`].
 
 use std::error::Error;
+use std::io::Write;
 use std::path::PathBuf;
 
 use clap::{Parser, ValueEnum};
 
-use tapgres::{capture, proxy, tui};
+use tapgres::{capture, decode, proxy, tui};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -102,7 +103,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             if args.tui {
                 tui::run_pcap(opts)
             } else {
-                capture::run(opts)
+                run_stdout(move || capture::run(opts))
             }
         }
         Mode::Mitm => {
@@ -117,10 +118,43 @@ fn main() -> Result<(), Box<dyn Error>> {
             if args.tui {
                 tui::run_mitm(opts)
             } else {
-                proxy::run(opts)
+                run_stdout(move || proxy::run(opts))
             }
         }
     }
+}
+
+/// Run `source` with its decoded output funneled through a single consumer
+/// thread: decoded lines to stdout, status to stderr. When `source` returns,
+/// close the channel and join the consumer so nothing is left unflushed.
+fn run_stdout<F>(source: F) -> Result<(), Box<dyn Error>>
+where
+    F: FnOnce() -> Result<(), Box<dyn Error>>,
+{
+    let (tx, rx) = crossbeam_channel::unbounded();
+    decode::set_output(tx);
+    let printer = std::thread::Builder::new()
+        .name("tapgres-out".into())
+        .spawn(move || {
+            let mut stdout = std::io::stdout().lock();
+            let mut stderr = std::io::stderr().lock();
+            while let Ok(record) = rx.recv() {
+                match record {
+                    decode::Output::Line(s) => {
+                        let _ = writeln!(stdout, "{s}");
+                    }
+                    decode::Output::Status(s) => {
+                        let _ = writeln!(stderr, "{s}");
+                    }
+                }
+            }
+            let _ = stdout.flush();
+            let _ = stderr.flush();
+        })?;
+    let result = source();
+    decode::close_output();
+    let _ = printer.join();
+    result
 }
 
 /// Default on-disk location for the auto-generated CA + server cert.

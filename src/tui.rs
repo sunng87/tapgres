@@ -2,7 +2,7 @@
 //!
 //! An orthogonal presentation layer over the existing traffic sources: the
 //! pcap capture or the mitm proxy runs in a background thread and feeds decoded
-//! lines into [`crate::decode::SharedSink`]; the TUI drains them on the main
+//! lines onto a channel; the TUI drains them on the main
 //! thread and renders a scrollable, filterable view with [ratatui].
 //!
 //! First-cut controls:
@@ -12,9 +12,9 @@
 //! - `/` — filter by substring (`Enter` applies, `Esc` cancels)
 //! - `c` — clear
 
+use crossbeam_channel::Receiver;
 use std::error::Error;
 use std::io;
-use std::sync::Arc;
 use std::time::Duration;
 
 use ratatui::Frame;
@@ -25,7 +25,7 @@ use ratatui::text::{Line, Text};
 use ratatui::widgets::{Block, Paragraph};
 
 use crate::capture::PcapOpts;
-use crate::decode::{self, SharedSink};
+use crate::decode::{self, Output};
 use crate::proxy::ProxyOpts;
 
 /// Cap on retained lines in the TUI's own buffer.
@@ -71,9 +71,10 @@ fn run(
     source: Box<dyn FnOnce() + Send + 'static>,
     mode: &'static str,
 ) -> Result<(), Box<dyn Error>> {
-    let sink = Arc::new(SharedSink::new());
-    // Best-effort: ignore if already set (e.g. nested invocation).
-    let _ = decode::SHARED_SINK.set(sink.clone());
+    // One channel: the source (background thread) produces via decode::out,
+    // the TUI (this thread) consumes.
+    let (tx, rx) = crossbeam_channel::unbounded();
+    decode::set_output(tx);
 
     // The source runs until the process exits; no graceful shutdown here.
     let _source_thread = std::thread::Builder::new()
@@ -81,7 +82,7 @@ fn run(
         .spawn(source)?;
 
     let mut terminal = ratatui::try_init()?;
-    let result = app_loop(&mut terminal, App::new(sink, mode));
+    let result = app_loop(&mut terminal, App::new(rx, mode));
     // Restore the terminal even on error. try_init installs a panic hook that
     // also restores, so panics are covered too.
     let _ = ratatui::try_restore();
@@ -89,7 +90,7 @@ fn run(
 }
 
 struct App {
-    sink: Arc<SharedSink>,
+    rx: Receiver<Output>,
     events: Vec<String>,
     /// Active substring filter (empty = none), case-insensitive.
     filter: String,
@@ -104,9 +105,9 @@ struct App {
 }
 
 impl App {
-    fn new(sink: Arc<SharedSink>, mode: &'static str) -> Self {
+    fn new(rx: Receiver<Output>, mode: &'static str) -> Self {
         Self {
-            sink,
+            rx,
             events: Vec::new(),
             filter: String::new(),
             filter_buf: String::new(),
@@ -134,7 +135,12 @@ fn filtered<'a>(events: &'a [String], filter: &str) -> Vec<&'a String> {
 
 fn app_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Result<()> {
     loop {
-        app.sink.drain_into(&mut app.events);
+        while let Ok(record) = app.rx.try_recv() {
+            let line = match record {
+                Output::Line(s) | Output::Status(s) => s,
+            };
+            app.events.push(line);
+        }
         if app.events.len() > HISTORY_CAP {
             let drop_n = app.events.len() - HISTORY_CAP;
             app.events.drain(..drop_n);
