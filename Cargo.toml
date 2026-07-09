@@ -19,3 +19,15 @@ pcap = "2.4"
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+# --- MITM proxy mode (`--mode mitm`) ---
+# tokio drives the per-connection relay; tokio-rustls terminates TLS on the
+# client leg and (optionally) re-encrypts on the upstream leg.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+# tokio-rustls/rustls defaults pull in `aws_lc_rs` (→ aws-lc-sys, which needs
+# cmake/perl). Pin both to the `ring` provider to keep the build self-contained.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pemfile = "2"
+# rcgen generates the CA + server certificate used to terminate client TLS.
+rcgen = "0.13"
