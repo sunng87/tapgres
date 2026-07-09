@@ -1,48 +1,108 @@
-//! tapgres — passive PostgreSQL wire-protocol monitor.
+//! tapgres — PostgreSQL wire-protocol monitor.
 //!
-//! Captures TCP traffic on a user-specified local PostgreSQL port using
-//! libpcap, reassembles each connection's two byte streams, and decodes them
-//! with the `pgwire` protocol layer into human-readable stdout output.
+//! Two operating modes, selected with `--mode`:
 //!
-//! Cleartext connections only. Requires privileges to capture (`CAP_NET_RAW` or
-//! root): run as root, grant the binary the capability, or capture on an
-//! interface you have capture rights to.
+//! - `pcap` (default): passively captures TCP traffic on a local PostgreSQL
+//!   port with libpcap, reassembles each connection's two byte streams, and
+//!   decodes them with the `pgwire` protocol layer into human-readable stdout.
+//!   Cleartext connections only. Requires capture privileges (`CAP_NET_RAW` or
+//!   root).
+//! - `mitm`: runs a local TLS-terminating proxy. Point your client at the proxy
+//!   instead of the server; the proxy decrypts the client leg, decodes the
+//!   traffic in the middle, and forwards it to the real server. See
+//!   [`tapgres::proxy`].
 
 use std::error::Error;
+use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use pcap::{Capture, Device};
 
-use tapgres::{flow, net};
+use tapgres::{flow, net, proxy};
 
 #[derive(Parser, Debug)]
 #[command(
     name = "tapgres",
     version,
-    about = "Passively tap a local PostgreSQL port and decode its wire traffic to stdout"
+    about = "Tap a local PostgreSQL port and decode its wire traffic to stdout"
 )]
 struct Args {
-    /// PostgreSQL TCP port to monitor.
+    /// Operating mode.
+    #[arg(long, value_enum, default_value_t = Mode::Pcap)]
+    mode: Mode,
+
+    // --- pcap mode ---------------------------------------------------------
+    /// [pcap] PostgreSQL TCP port to monitor.
     #[arg(short, long, default_value_t = 5432)]
     port: u16,
 
-    /// Capture interface. Defaults to the loopback interface; pass "any" to
-    /// capture on all interfaces.
+    /// [pcap] Capture interface. Defaults to loopback; pass "any" for all.
     #[arg(short, long)]
     interface: Option<String>,
 
-    /// Do not put the interface in promiscuous mode.
+    /// [pcap] Do not put the interface in promiscuous mode.
     #[arg(long, default_value_t = false)]
     no_promisc: bool,
 
-    /// Maximum bytes captured per packet (snaplen).
+    /// [pcap] Maximum bytes captured per packet (snaplen).
     #[arg(long, default_value_t = 65535)]
     snaplen: i32,
+
+    // --- mitm mode ---------------------------------------------------------
+    /// [mitm] Address to listen on for client connections.
+    #[arg(long, default_value = "127.0.0.1:15432")]
+    listen: String,
+
+    /// [mitm] Upstream PostgreSQL server to forward to.
+    #[arg(long, default_value = "127.0.0.1:5432")]
+    upstream: String,
+
+    /// [mitm] Directory for the auto-generated CA + server cert.
+    /// Defaults to `$XDG_CONFIG_HOME/tapgres` or `~/.config/tapgres`.
+    #[arg(long)]
+    tls_dir: Option<PathBuf>,
+
+    /// [mitm] PEM server cert to present to clients (overrides auto-generation).
+    #[arg(long)]
+    tls_cert: Option<PathBuf>,
+
+    /// [mitm] PEM private key for --tls-cert.
+    #[arg(long)]
+    tls_key: Option<PathBuf>,
+
+    /// [mitm] Disable TLS on the upstream leg (talk cleartext to the server).
+    #[arg(long, default_value_t = false)]
+    no_upstream_tls: bool,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum Mode {
+    /// Passive libpcap capture (cleartext only).
+    Pcap,
+    /// Local TLS-terminating proxy.
+    Mitm,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
+    match args.mode {
+        Mode::Pcap => run_pcap(args),
+        Mode::Mitm => {
+            let opts = proxy::ProxyOpts {
+                listen: args.listen,
+                upstream: args.upstream,
+                tls_dir: args.tls_dir.unwrap_or_else(default_tls_dir),
+                tls_cert: args.tls_cert,
+                tls_key: args.tls_key,
+                no_upstream_tls: args.no_upstream_tls,
+            };
+            proxy::run(opts)
+        }
+    }
+}
 
+/// Passive capture + decode loop (the original tapgres behaviour).
+fn run_pcap(args: Args) -> Result<(), Box<dyn Error>> {
     let device = resolve_device(args.interface.as_deref())?;
 
     eprintln!(
@@ -77,6 +137,17 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
     Ok(())
+}
+
+/// Default on-disk location for the auto-generated CA + server cert.
+fn default_tls_dir() -> PathBuf {
+    if let Ok(d) = std::env::var("XDG_CONFIG_HOME") {
+        return PathBuf::from(d).join("tapgres");
+    }
+    if let Ok(h) = std::env::var("HOME") {
+        return PathBuf::from(h).join(".config").join("tapgres");
+    }
+    PathBuf::from(".tapgres")
 }
 
 /// Resolve which capture device to use.

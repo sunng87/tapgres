@@ -62,6 +62,20 @@ impl Direction {
         }
     }
 
+    /// Decode-only constructor: no TCP reassembly state is exercised. Used by
+    /// the MITM proxy, which already has clean, in-order plaintext bytes from
+    /// the (possibly TLS-terminated) socket and feeds them straight into
+    /// [`Direction::rxbuf`].
+    ///
+    /// The proxy terminates TLS at the socket layer, so the first plaintext
+    /// bytes are a `Startup` message — never the SSL/GSS negotiation the pcap
+    /// path expects. We clear the SSL-awaiting flag accordingly.
+    pub fn for_decoding(role: Role) -> Self {
+        let mut d = Direction::new(role);
+        d.ctx.awaiting_frontend_ssl = false;
+        d
+    }
+
     /// Feed a TCP segment's payload into this direction's reassembly buffer.
     /// SYN consumes one sequence number; data is delivered in order, with
     /// retransmissions de-duplicated and out-of-order segments buffered.
