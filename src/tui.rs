@@ -296,10 +296,10 @@ fn draw(frame: &mut Frame, app: &App, view: &[&String], log_h: usize) {
     }
 }
 
-/// Render a line with only the direction symbol (`[F→B]`/`[B→F]`) highlighted;
-/// everything else stays the default colour for easy reading. The two symbols
-/// use high-contrast colours (F→B cyan, B→F magenta) so direction is obvious at
-/// a glance. Warnings stay red and connection notices yellow.
+/// Render a line with the direction symbol (`[F→B]`/`[B→F]`) highlighted in a
+/// high-contrast colour (F→B cyan, B→F magenta, bold) and the packet name
+/// (e.g. `Query`, `DataRow`) bold; all other text stays the default colour for
+/// easy reading. Warnings stay red and connection notices yellow.
 fn build_line(line: &str) -> Line<'_> {
     if line.contains('⚠') {
         return Line::styled(line, Style::default().fg(Color::Red));
@@ -310,11 +310,19 @@ fn build_line(line: &str) -> Line<'_> {
     let Some((color, start, end)) = direction_split(line) else {
         return Line::styled(line, Style::default());
     };
-    // "[ts] [F→B] KIND: text" -> prefix | symbol | suffix
+    // "[ts] [F→B] KIND: text" -> prefix | symbol | gap | kind | rest.
+    // Skip the single space after the symbol closing bracket.
+    let kind_start = (end + 1).min(line.len());
+    let kind_end = line[kind_start..]
+        .find(": ")
+        .map(|p| kind_start + p)
+        .unwrap_or(line.len());
     Line::from(vec![
         Span::raw(&line[..start]),
         Span::raw(&line[start..end]).fg(color).bold(),
-        Span::raw(&line[end..]),
+        Span::raw(&line[end..kind_start]),
+        Span::raw(&line[kind_start..kind_end]).bold(),
+        Span::raw(&line[kind_end..]),
     ])
 }
 
