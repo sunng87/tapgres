@@ -1707,7 +1707,6 @@ dependencies = [
  "chrono",
  "clap",
  "crossbeam-channel",
- "libc",
  "pcap",
  "pgwire",
  "ratatui",

@@ -22,15 +22,10 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 # --- TUI (`--tui`) ---
 # ratatui re-exports crossterm (its default backend), so we use that for events.
-# `unstable-rendered-line-info` exposes Paragraph::line_count, used to size each
-# (possibly wrapped) row so the zebra background can fill the whole line.
-ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
+ratatui = "0.30"
 # crossbeam-channel carries decoded lines from the (possibly multi-threaded)
 # source to the output consumer (stdout-printer thread or the TUI).
 crossbeam-channel = "0.5"
-# libc: non-blocking stdin read to probe the terminal's default background
-# colour (OSC 11) so zebra striping picks a readable shade.
-libc = "0.2"
 
 # --- MITM proxy mode (`--mode mitm`) ---
 # tokio drives the per-connection relay; tokio-rustls terminates TLS on the
