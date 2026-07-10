@@ -84,7 +84,7 @@ the upstream certificate — it assumes a local, operator-controlled server.
 
 ## Interactive TUI (`--tui`)
 
-![tapgres TUI: decoded PostgreSQL traffic](tui.png)
+![tapgres TUI: decoded PostgreSQL traffic](screenshots/tui.png)
 
 Add `--tui` to either mode for a full-screen, scrollable view instead of
 line-oriented stdout. The chosen source runs in a background thread and feeds
