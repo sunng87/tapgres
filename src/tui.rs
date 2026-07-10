@@ -132,11 +132,13 @@ fn app_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Result
         let log_h = term_h.saturating_sub(8).max(1);
 
         // With wrap on, each event may occupy several rows, so allow scrolling
-        // all the way to the last event; otherwise keep the viewport full.
+        // all the way to the last event. Otherwise rows are separated by a blank
+        // line for readability, so a full viewport shows about half as many
+        // events.
         let max_scroll = if app.wrap {
             app.events.len().saturating_sub(1)
         } else {
-            app.events.len().saturating_sub(log_h)
+            app.events.len().saturating_sub(log_h.div_ceil(2))
         };
         if app.follow {
             app.scroll = max_scroll;
@@ -221,20 +223,36 @@ fn draw(frame: &mut Frame, app: &App, log_h: usize) {
     frame.render_widget(Block::bordered().title_top(Line::raw(title)), title_area);
 
     // --- packet view ---
-    let start = app.scroll;
-    let end = (start + log_h).min(app.events.len());
-    let lines: Vec<Line> = app.events[start..end]
-        .iter()
-        .map(|l| build_line(l.as_str()))
-        .collect();
     let log_block = Block::bordered()
         .title_top(Line::raw(" packets "))
         .border_style(Style::default().fg(Color::Green));
-    let mut para = Paragraph::new(Text::from(lines)).block(log_block);
+    let start = app.scroll;
     if app.wrap {
-        para = para.wrap(Wrap { trim: false });
+        // Wrap mode: dense — a per-row blank separator isn't feasible without
+        // per-line height info, so just wrap into the viewport.
+        let end = (start + log_h).min(app.events.len());
+        let lines: Vec<Line> = app.events[start..end]
+            .iter()
+            .map(|l| build_line(l.as_str()))
+            .collect();
+        let para = Paragraph::new(Text::from(lines))
+            .block(log_block)
+            .wrap(Wrap { trim: false });
+        frame.render_widget(para, log_area);
+    } else {
+        // A blank line between rows for readability; each event then occupies
+        // two rows, so show half the viewport's worth of events.
+        let win = log_h.div_ceil(2);
+        let end = (start + win).min(app.events.len());
+        let mut lines: Vec<Line> = Vec::new();
+        for (i, line) in app.events[start..end].iter().enumerate() {
+            if i > 0 {
+                lines.push(Line::raw(""));
+            }
+            lines.push(build_line(line.as_str()));
+        }
+        frame.render_widget(Paragraph::new(Text::from(lines)).block(log_block), log_area);
     }
-    frame.render_widget(para, log_area);
 
     // --- footer ---
     frame.render_widget(
