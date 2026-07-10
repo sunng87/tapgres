@@ -131,13 +131,9 @@ fn app_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Result
         let term_h = terminal.size()?.height as usize;
         let log_h = term_h.saturating_sub(8).max(1);
 
-        // With wrap on, each event may occupy several rows, so allow scrolling
-        // all the way to the last event; otherwise keep the viewport full.
-        let max_scroll = if app.wrap {
-            app.events.len().saturating_sub(1)
-        } else {
-            app.events.len().saturating_sub(log_h)
-        };
+        // follow pins the view to the newest events: the last `log_h` of them
+        // fill the viewport (short lines are one row; long ones wrap/clip).
+        let max_scroll = app.events.len().saturating_sub(log_h);
         if app.follow {
             app.scroll = max_scroll;
         }
