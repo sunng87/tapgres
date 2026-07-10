@@ -103,11 +103,14 @@ Keybindings:
 | `j`/`k`, arrows, `PgUp`/`PgDn` | scroll |
 | `g` / `G` | top / bottom |
 | `f` | toggle follow (auto-tail) |
+| `w` | toggle line wrap |
 | `c` | clear |
 
 The direction symbol is highlighted in a high-contrast colour (`[F→B]` cyan,
 `[B→F]` magenta) and the packet name is bold; warnings are red and connection
-notices yellow. `--tui` with `pcap` still needs capture privileges.
+notices yellow. The packet view has a green border and zebra-striped rows whose
+shade is picked from the terminal's background (dark vs light, probed via
+OSC 11 / `COLORFGBG`). `--tui` with `pcap` still needs capture privileges.
 
 ## Install
 

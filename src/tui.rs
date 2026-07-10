@@ -9,6 +9,7 @@
 //! - `q` / `Ctrl-C` — quit
 //! - `j`/`k`, arrows, `PgUp`/`PgDn`, `g`/`G` — scroll
 //! - `f` — toggle follow (auto-tail)
+//! - `w` — toggle line wrap
 //! - `c` — clear
 
 use crossbeam_channel::Receiver;
@@ -21,7 +22,7 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, Ke
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Paragraph};
+use ratatui::widgets::{Block, Paragraph, Wrap};
 
 use crate::capture::PcapOpts;
 use crate::decode::{self, Output};
@@ -81,7 +82,10 @@ fn run(
         .spawn(source)?;
 
     let mut terminal = ratatui::try_init()?;
-    let result = app_loop(&mut terminal, App::new(rx, mode));
+    // Probe the terminal's default background (best-effort) so zebra striping
+    // picks a shade that reads on dark vs light themes.
+    let theme = detect_bg_theme();
+    let result = app_loop(&mut terminal, App::new(rx, mode, theme));
     // Restore the terminal even on error. try_init installs a panic hook that
     // also restores, so panics are covered too.
     let _ = ratatui::try_restore();
@@ -95,16 +99,22 @@ struct App {
     scroll: usize,
     /// Auto-tail new output.
     follow: bool,
+    /// Wrap long lines to the viewport width.
+    wrap: bool,
+    /// Terminal background theme — chooses the zebra-stripe shade.
+    theme: BgTheme,
     mode: &'static str,
 }
 
 impl App {
-    fn new(rx: Receiver<Output>, mode: &'static str) -> Self {
+    fn new(rx: Receiver<Output>, mode: &'static str, theme: BgTheme) -> Self {
         Self {
             rx,
             events: Vec::new(),
             scroll: 0,
             follow: true,
+            wrap: false,
+            theme,
             mode,
         }
     }
@@ -127,7 +137,13 @@ fn app_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Result
         let term_h = terminal.size()?.height as usize;
         let log_h = term_h.saturating_sub(8).max(1);
 
-        let max_scroll = app.events.len().saturating_sub(log_h);
+        // With wrap on, each event may occupy several rows, so allow scrolling
+        // all the way to the last event; otherwise keep the viewport full.
+        let max_scroll = if app.wrap {
+            app.events.len().saturating_sub(1)
+        } else {
+            app.events.len().saturating_sub(log_h)
+        };
         if app.follow {
             app.scroll = max_scroll;
         }
@@ -183,6 +199,7 @@ fn handle_key(app: &mut App, log_h: usize, key: KeyEvent) -> bool {
             app.scroll = 0;
         }
         KeyCode::Char('f') => app.follow = !app.follow,
+        KeyCode::Char('w') => app.wrap = !app.wrap,
         KeyCode::Char('c') => app.events.clear(),
         _ => {}
     }
@@ -199,30 +216,39 @@ fn draw(frame: &mut Frame, app: &App, log_h: usize) {
 
     // --- title bar ---
     let follow_tag = if app.follow { " · following" } else { "" };
+    let wrap_tag = if app.wrap { " · wrap" } else { "" };
     let title = format!(
-        " tapgres — {} mode · {} events{} ",
+        " tapgres — {} mode · {} events{}{} ",
         app.mode,
         app.events.len(),
-        follow_tag
+        follow_tag,
+        wrap_tag,
     );
     frame.render_widget(Block::bordered().title_top(Line::raw(title)), title_area);
 
-    // --- log ---
+    // --- packet view ---
     let start = app.scroll;
     let end = (start + log_h).min(app.events.len());
-    let lines: Vec<Line> = app.events[start..end]
-        .iter()
-        .map(|l| build_line(l.as_str()))
-        .collect();
-    frame.render_widget(
-        Paragraph::new(Text::from(lines)).block(Block::bordered().title_top(Line::raw(" events "))),
-        log_area,
-    );
+    let stripe = app.theme.stripe_color();
+    let mut lines: Vec<Line> = Vec::with_capacity(end - start);
+    for (i, line) in app.events[start..end].iter().enumerate() {
+        // Zebra striping by visible row so the bands stay put while scrolling.
+        let bg = (i % 2 == 1).then_some(stripe);
+        lines.push(build_line(line.as_str(), bg));
+    }
+    let log_block = Block::bordered()
+        .title_top(Line::raw(" packets "))
+        .border_style(Style::default().fg(Color::Green));
+    let mut para = Paragraph::new(Text::from(lines)).block(log_block);
+    if app.wrap {
+        para = para.wrap(Wrap { trim: false });
+    }
+    frame.render_widget(para, log_area);
 
     // --- footer ---
     frame.render_widget(
         Paragraph::new(Text::raw(
-            " q quit · j/k ↑↓ · PgUp/PgDn · g/G top/bottom · f follow · c clear ",
+            " q quit · j/k ↑↓ · PgUp/PgDn · g/G top/bottom · f follow · w wrap · c clear ",
         ))
         .block(Block::bordered()),
         foot_area,
@@ -232,16 +258,17 @@ fn draw(frame: &mut Frame, app: &App, log_h: usize) {
 /// Render a line with the direction symbol (`[F→B]`/`[B→F]`) highlighted in a
 /// high-contrast colour (F→B cyan, B→F magenta, bold) and the packet name
 /// (e.g. `Query`, `DataRow`) bold; all other text stays the default colour for
-/// easy reading. Warnings stay red and connection notices yellow.
-fn build_line(line: &str) -> Line<'_> {
+/// easy reading. `bg` optionally paints a zebra-stripe background. Warnings
+/// stay red and connection notices yellow.
+fn build_line(line: &str, bg: Option<Color>) -> Line<'_> {
     if line.contains('⚠') {
-        return Line::styled(line, Style::default().fg(Color::Red));
+        return Line::styled(line, with_bg(Style::default().fg(Color::Red), bg));
     }
     if line.contains("===") {
-        return Line::styled(line, Style::default().fg(Color::Yellow));
+        return Line::styled(line, with_bg(Style::default().fg(Color::Yellow), bg));
     }
     let Some((color, start, end)) = direction_split(line) else {
-        return Line::styled(line, Style::default());
+        return Line::styled(line, with_bg(Style::default(), bg));
     };
     // "[ts] [F→B] KIND: text" -> prefix | symbol | gap | kind | rest.
     // Skip the single space after the symbol closing bracket.
@@ -250,13 +277,24 @@ fn build_line(line: &str) -> Line<'_> {
         .find(": ")
         .map(|p| kind_start + p)
         .unwrap_or(line.len());
-    Line::from(vec![
+    let mut l = Line::from(vec![
         Span::raw(&line[..start]),
         Span::raw(&line[start..end]).fg(color).bold(),
         Span::raw(&line[end..kind_start]),
         Span::raw(&line[kind_start..kind_end]).bold(),
         Span::raw(&line[kind_end..]),
-    ])
+    ]);
+    if let Some(c) = bg {
+        l = l.style(Style::default().bg(c));
+    }
+    l
+}
+
+fn with_bg(style: Style, bg: Option<Color>) -> Style {
+    match bg {
+        Some(c) => style.bg(c),
+        None => style,
+    }
 }
 
 /// If `line` carries a direction tag, return `(colour, byte start, byte end)`
@@ -268,4 +306,144 @@ fn direction_split(line: &str) -> Option<(Color, usize, usize)> {
         }
     }
     None
+}
+
+// ---------------------------------------------------------------------------
+// Terminal background detection — picks a zebra-stripe shade that reads on the
+// user's theme. Tries OSC 11 (the terminal's default bg) first, then the
+// `COLORFGBG` env var, then assumes dark.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy)]
+enum BgTheme {
+    Dark,
+    Light,
+}
+
+impl BgTheme {
+    /// A subtle background for zebra striping: just-lighter-than-black on dark
+    /// themes, just-darker-than-white on light themes.
+    fn stripe_color(self) -> Color {
+        match self {
+            BgTheme::Dark => Color::Indexed(236),
+            BgTheme::Light => Color::Indexed(254),
+        }
+    }
+}
+
+fn detect_bg_theme() -> BgTheme {
+    if let Some((r, g, b)) = query_default_bg() {
+        // Rec. 709 luma; below the midpoint reads as a dark background.
+        let lum = 0.299 * f32::from(r) + 0.587 * f32::from(g) + 0.114 * f32::from(b);
+        return if lum < 128.0 {
+            BgTheme::Dark
+        } else {
+            BgTheme::Light
+        };
+    }
+    if let Some(theme) = parse_colorfgbg() {
+        return theme;
+    }
+    BgTheme::Dark
+}
+
+#[cfg(unix)]
+fn query_default_bg() -> Option<(u8, u8, u8)> {
+    use std::io::{Read, Write};
+    use std::os::unix::io::AsRawFd;
+
+    // Ask the terminal for its default background (OSC 11, ST-terminated).
+    {
+        let mut out = std::io::stdout().lock();
+        let _ = out.write_all(b"\x1b]11;?\x1b\\");
+        let _ = out.flush();
+    }
+
+    // Read the reply non-blocking so we can't hang on terminals that ignore it.
+    let fd = std::io::stdin().as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return None;
+    }
+    unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+    struct RestoreFlags(i32, i32);
+    impl Drop for RestoreFlags {
+        fn drop(&mut self) {
+            unsafe { libc::fcntl(self.0, libc::F_SETFL, self.1) };
+        }
+    }
+    let _restore = RestoreFlags(fd, flags); // always restore blocking mode
+
+    let mut got: Vec<u8> = Vec::with_capacity(64);
+    let mut buf = [0u8; 64];
+    let deadline = std::time::Instant::now() + Duration::from_millis(100);
+    loop {
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        match std::io::stdin().lock().read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                got.extend_from_slice(&buf[..n]);
+                // Done once we see the ST (ESC \) or BEL terminator.
+                if got.ends_with(b"\x07") || got.windows(2).any(|w| w == b"\x1b\\") {
+                    break;
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(4));
+                continue;
+            }
+            Err(_) => break,
+        }
+    }
+    parse_osc_rgb(&got)
+}
+
+#[cfg(not(unix))]
+fn query_default_bg() -> Option<(u8, u8, u8)> {
+    None
+}
+
+/// Parse an OSC color reply of the form `...rgb:rrrr/gggg/bbbb...` (or
+/// `rgba:...`) into an 8-bit-per-channel triple.
+fn parse_osc_rgb(bytes: &[u8]) -> Option<(u8, u8, u8)> {
+    let s = std::str::from_utf8(bytes).ok()?;
+    let rgb = s.find("rgb")?;
+    let rest = &s[rgb..];
+    let colon = rest.find(':')?;
+    let mut parts = rest[colon + 1..].split('/');
+    let r = parse_hex_channel(parts.next()?)?;
+    let g = parse_hex_channel(parts.next()?)?;
+    let b = parse_hex_channel(parts.next()?)?;
+    Some((r, g, b))
+}
+
+/// Decode one OSC color channel (1–4 hex digits) into a u8.
+fn parse_hex_channel(group: &str) -> Option<u8> {
+    let hex: String = group
+        .chars()
+        .take_while(|c| c.is_ascii_hexdigit())
+        .collect();
+    if hex.is_empty() {
+        return None;
+    }
+    let normalized = if hex.len() >= 2 {
+        hex[..2].to_string()
+    } else {
+        format!("{hex}{hex}")
+    };
+    u8::from_str_radix(&normalized, 16).ok()
+}
+
+/// Fall back to the legacy `COLORFGBG="fg;bg"` env var (set by some terminals).
+fn parse_colorfgbg() -> Option<BgTheme> {
+    let val = std::env::var("COLORFGBG").ok()?;
+    let bg: u8 = val.split(';').nth(1)?.trim().parse().ok()?;
+    // 0–6 and 8 are dark; 7 and 9–15 are light.
+    Some(if bg <= 6 || bg == 8 {
+        BgTheme::Dark
+    } else {
+        BgTheme::Light
+    })
 }
