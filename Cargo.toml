@@ -22,7 +22,9 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 # --- TUI (`--tui`) ---
 # ratatui re-exports crossterm (its default backend), so we use that for events.
-ratatui = "0.30"
+# `unstable-rendered-line-info` exposes Paragraph::line_count, used to fit the
+# wrap-mode viewport to whole items so multi-line events aren't clipped.
+ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 # crossbeam-channel carries decoded lines from the (possibly multi-threaded)
 # source to the output consumer (stdout-printer thread or the TUI).
 crossbeam-channel = "0.5"
