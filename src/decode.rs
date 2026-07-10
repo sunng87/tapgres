@@ -7,6 +7,9 @@
 
 use std::cell::RefCell;
 use std::fmt::Write as _;
+use std::sync::Mutex;
+
+use crossbeam_channel::Sender;
 
 use bytes::{Buf, Bytes};
 use chrono::Local;
@@ -48,23 +51,77 @@ pub fn ts() -> String {
     Local::now().format("%H:%M:%S%.3f").to_string()
 }
 
-// --- swappable output (so the decoder can be tested without capturing stdout) ---
+// --- output routing -------------------------------------------------------
 //
-// Thread-local so parallel integration tests each capture only their own
-// output: every test (and the decode it drives) runs on the same thread.
+// The decoder never decides *where* its output goes. `out`/`status` push onto
+// a single multi-producer channel (`OUTPUT_TX`); a consumer chosen at startup
+// owns the receiver — a stdout-printer thread for the line-oriented path, or
+// the TUI app loop for `--tui`. So the decoder is fully sink-agnostic, and the
+// stdout/stderr split (`Line`→stdout, `Status`→stderr) is preserved by the
+// consumer rather than baked into the decoder.
+//
+// Thread-local `CAPTURE` is a higher-priority short-circuit so the integration
+// tests can assert decoded output without spinning up a consumer.
 thread_local! {
     static CAPTURE: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
 }
 
-/// Emit one decoded line of output. When a test capture is active, lines are
-/// buffered instead of printed.
-pub fn out(line: String) {
+/// What kind of output a record is, so the consumer can route it (decoded lines
+/// to stdout, status to stderr) without re-parsing the text.
+#[derive(Debug, Clone)]
+pub enum Output {
+    /// A decoded protocol line.
+    Line(String),
+    /// A status/informational line.
+    Status(String),
+}
+
+/// The global producer handle. `None` (the default) means no consumer is wired
+/// and `out`/`status` print directly to stdout/stderr.
+static OUTPUT_TX: Mutex<Option<Sender<Output>>> = Mutex::new(None);
+
+/// Install the channel producers write to. The matching receiver is owned by
+/// whichever consumer is active (stdout-printer thread, or the TUI).
+pub fn set_output(tx: Sender<Output>) {
+    *OUTPUT_TX.lock().unwrap() = Some(tx);
+}
+
+/// Drop the producer handle so the consumer observes end-of-stream and can
+/// flush/drain.
+pub fn close_output() {
+    *OUTPUT_TX.lock().unwrap() = None;
+}
+
+fn deliver(record: Output) {
+    // Tests capture decoded lines locally (no consumer thread / channel).
     let buffered = CAPTURE.with(|c| c.borrow().is_some());
     if buffered {
-        CAPTURE.with(|c| c.borrow_mut().as_mut().unwrap().push(line));
-    } else {
-        println!("{line}");
+        if let Output::Line(s) = record {
+            CAPTURE.with(|c| c.borrow_mut().as_mut().unwrap().push(s));
+        }
+        return;
     }
+    if let Some(tx) = &*OUTPUT_TX.lock().unwrap() {
+        let _ = tx.send(record); // unbounded channel: never blocks
+        return;
+    }
+    // No consumer wired: fall back to direct terminal output.
+    match record {
+        Output::Line(s) => println!("{s}"),
+        Output::Status(s) => eprintln!("{s}"),
+    }
+}
+
+/// Emit one decoded protocol line. Routed to the output consumer, or stdout if
+/// none is wired.
+pub fn out(line: String) {
+    deliver(Output::Line(line));
+}
+
+/// Emit a status/informational line. On the stdout path it goes to stderr; under
+/// `--tui` it appears in the list alongside decoded lines.
+pub fn status(msg: String) {
+    deliver(Output::Status(msg));
 }
 
 /// Begin capturing decoded output into a buffer (for tests).

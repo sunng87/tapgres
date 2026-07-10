@@ -1,6 +1,6 @@
 //! tapgres — PostgreSQL wire-protocol monitor.
 //!
-//! Two operating modes, selected with `--mode`:
+//! Traffic sources, selected with `--mode`:
 //!
 //! - `pcap` (default): passively captures TCP traffic on a local PostgreSQL
 //!   port with libpcap, reassembles each connection's two byte streams, and
@@ -11,14 +11,17 @@
 //!   instead of the server; the proxy decrypts the client leg, decodes the
 //!   traffic in the middle, and forwards it to the real server. See
 //!   [`tapgres::proxy`].
+//!
+//! Add `--tui` to either mode for an interactive, scrollable, filterable view
+//! instead of line-oriented stdout. See [`tapgres::tui`].
 
 use std::error::Error;
+use std::io::Write;
 use std::path::PathBuf;
 
 use clap::{Parser, ValueEnum};
-use pcap::{Capture, Device};
 
-use tapgres::{flow, net, proxy};
+use tapgres::{capture, decode, proxy, tui};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -27,9 +30,13 @@ use tapgres::{flow, net, proxy};
     about = "Tap a local PostgreSQL port and decode its wire traffic to stdout"
 )]
 struct Args {
-    /// Operating mode.
+    /// Traffic source.
     #[arg(long, value_enum, default_value_t = Mode::Pcap)]
     mode: Mode,
+
+    /// Interactive TUI instead of line-oriented stdout (works with any --mode).
+    #[arg(long, default_value_t = false)]
+    tui: bool,
 
     // --- pcap mode ---------------------------------------------------------
     /// [pcap] PostgreSQL TCP port to monitor.
@@ -86,7 +93,19 @@ enum Mode {
 fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
     match args.mode {
-        Mode::Pcap => run_pcap(args),
+        Mode::Pcap => {
+            let opts = capture::PcapOpts {
+                port: args.port,
+                interface: args.interface,
+                no_promisc: args.no_promisc,
+                snaplen: args.snaplen,
+            };
+            if args.tui {
+                tui::run_pcap(opts)
+            } else {
+                run_stdout(move || capture::run(opts))
+            }
+        }
         Mode::Mitm => {
             let opts = proxy::ProxyOpts {
                 listen: args.listen,
@@ -96,47 +115,46 @@ fn main() -> Result<(), Box<dyn Error>> {
                 tls_key: args.tls_key,
                 no_upstream_tls: args.no_upstream_tls,
             };
-            proxy::run(opts)
+            if args.tui {
+                tui::run_mitm(opts)
+            } else {
+                run_stdout(move || proxy::run(opts))
+            }
         }
     }
 }
 
-/// Passive capture + decode loop (the original tapgres behaviour).
-fn run_pcap(args: Args) -> Result<(), Box<dyn Error>> {
-    let device = resolve_device(args.interface.as_deref())?;
-
-    eprintln!(
-        "tapgres: capturing on '{}'  (filter: tcp port {})",
-        device.name, args.port
-    );
-    eprintln!(
-        "tapgres: note — only cleartext connections are decoded; run as root / grant CAP_NET_RAW."
-    );
-
-    let mut cap = Capture::from_device(device)?
-        .promisc(!args.no_promisc)
-        .snaplen(args.snaplen)
-        .timeout(1000)
-        .open()?;
-    cap.filter(&format!("tcp port {}", args.port), true)?;
-
-    let dlt = cap.get_datalink().0;
-    eprintln!("tapgres: datalink type = {} ({})", dlt, datalink_name(dlt));
-
-    let mut table = flow::ConnTable::new();
-    loop {
-        match cap.next_packet() {
-            Ok(packet) => {
-                if let Some(seg) = net::parse_frame(packet.data, dlt) {
-                    table.handle(&seg, args.port);
+/// Run `source` with its decoded output funneled through a single consumer
+/// thread: decoded lines to stdout, status to stderr. When `source` returns,
+/// close the channel and join the consumer so nothing is left unflushed.
+fn run_stdout<F>(source: F) -> Result<(), Box<dyn Error>>
+where
+    F: FnOnce() -> Result<(), Box<dyn Error>>,
+{
+    let (tx, rx) = crossbeam_channel::unbounded();
+    decode::set_output(tx);
+    let printer = std::thread::Builder::new()
+        .name("tapgres-out".into())
+        .spawn(move || {
+            let mut stdout = std::io::stdout().lock();
+            let mut stderr = std::io::stderr().lock();
+            while let Ok(record) = rx.recv() {
+                match record {
+                    decode::Output::Line(s) => {
+                        let _ = writeln!(stdout, "{s}");
+                    }
+                    decode::Output::Status(s) => {
+                        let _ = writeln!(stderr, "{s}");
+                    }
                 }
             }
-            Err(pcap::Error::TimeoutExpired) => continue,
-            Err(pcap::Error::NoMorePackets) => break,
-            Err(e) => return Err(e.into()),
-        }
-    }
-    Ok(())
+            let _ = stdout.flush();
+            let _ = stderr.flush();
+        })?;
+    let result = source();
+    decode::close_output();
+    let _ = printer.join();
+    result
 }
 
 /// Default on-disk location for the auto-generated CA + server cert.
@@ -148,48 +166,4 @@ fn default_tls_dir() -> PathBuf {
         return PathBuf::from(h).join(".config").join("tapgres");
     }
     PathBuf::from(".tapgres")
-}
-
-/// Resolve which capture device to use.
-///
-/// - `None` (the default): the loopback interface, found by its pcap loopback
-///   flag so it works regardless of OS naming (`lo` on Linux, `lo0` on
-///   macOS/BSD, ...).
-/// - `Some(name)`: a name matched against the enumerated interfaces. Falls back
-///   to a bare-name device so special targets like `any` (Linux's
-///   all-interfaces pseudo-device) keep working even though libpcap doesn't
-///   list them.
-fn resolve_device(interface: Option<&str>) -> Result<Device, String> {
-    let devices = Device::list().map_err(|e| format!("listing interfaces: {e}"))?;
-    match interface {
-        None => devices
-            .iter()
-            .find(|d| d.flags.is_loopback())
-            .cloned()
-            .ok_or_else(|| {
-                let names: Vec<&str> = devices.iter().map(|d| d.name.as_str()).collect();
-                format!(
-                    "no loopback interface found; pass --interface (available: {})",
-                    names.join(", ")
-                )
-            }),
-        Some(name) => Ok(devices
-            .iter()
-            .find(|d| d.name == name)
-            .cloned()
-            .unwrap_or_else(|| Device::from(name))),
-    }
-}
-
-fn datalink_name(dlt: i32) -> &'static str {
-    match dlt {
-        0 => "NULL (BSD loopback)",
-        1 => "EN10MB (Ethernet)",
-        12 | 101 => "RAW (raw IP)",
-        113 => "LINUX_SLL (cooked)",
-        276 => "LINUX_SLL2 (cooked v2)",
-        228 => "IPV4",
-        229 => "IPV6",
-        _ => "unknown",
-    }
 }
