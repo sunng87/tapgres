@@ -9,6 +9,7 @@
 //! - `q` / `Ctrl-C` — quit
 //! - `j`/`k`, arrows, `PgUp`/`PgDn`, `g`/`G` — scroll
 //! - `f` — toggle follow (auto-tail)
+//! - `w` — toggle line wrap
 //! - `c` — clear
 
 use crossbeam_channel::Receiver;
@@ -21,7 +22,7 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, Ke
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Paragraph};
+use ratatui::widgets::{Block, Paragraph, Wrap};
 
 use crate::capture::PcapOpts;
 use crate::decode::{self, Output};
@@ -95,6 +96,8 @@ struct App {
     scroll: usize,
     /// Auto-tail new output.
     follow: bool,
+    /// Wrap long lines to the viewport width.
+    wrap: bool,
     mode: &'static str,
 }
 
@@ -105,6 +108,7 @@ impl App {
             events: Vec::new(),
             scroll: 0,
             follow: true,
+            wrap: false,
             mode,
         }
     }
@@ -127,7 +131,14 @@ fn app_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Result
         let term_h = terminal.size()?.height as usize;
         let log_h = term_h.saturating_sub(8).max(1);
 
-        let max_scroll = app.events.len().saturating_sub(log_h);
+        // In wrap mode an event may span several rows, so the viewport holds
+        // fewer than `log_h` events; allow scrolling up to the last event.
+        // Otherwise the viewport shows `log_h` events.
+        let max_scroll = if app.wrap {
+            app.events.len().saturating_sub(1)
+        } else {
+            app.events.len().saturating_sub(log_h)
+        };
         if app.follow {
             app.scroll = max_scroll;
         }
@@ -183,6 +194,7 @@ fn handle_key(app: &mut App, log_h: usize, key: KeyEvent) -> bool {
             app.scroll = 0;
         }
         KeyCode::Char('f') => app.follow = !app.follow,
+        KeyCode::Char('w') => app.wrap = !app.wrap,
         KeyCode::Char('c') => app.events.clear(),
         _ => {}
     }
@@ -199,34 +211,101 @@ fn draw(frame: &mut Frame, app: &App, log_h: usize) {
 
     // --- title bar ---
     let follow_tag = if app.follow { " · following" } else { "" };
+    let wrap_tag = if app.wrap { " · wrap" } else { "" };
     let title = format!(
-        " tapgres — {} mode · {} events{} ",
+        " tapgres — {} mode · {} events{}{} ",
         app.mode,
         app.events.len(),
-        follow_tag
+        follow_tag,
+        wrap_tag,
     );
     frame.render_widget(Block::bordered().title_top(Line::raw(title)), title_area);
 
-    // --- log ---
-    let start = app.scroll;
-    let end = (start + log_h).min(app.events.len());
+    // --- packet view ---
+    let log_block = Block::bordered()
+        .title_top(Line::raw(" packets "))
+        .border_style(Style::default().fg(Color::Green));
+    let inner_w = log_area.width.saturating_sub(2) as usize;
+    // Size the window by display rows so every shown item is fully visible (no
+    // mid-item clipping): follow fills backward from the newest event, else
+    // forward from the scroll anchor. Without wrap each item is one row.
+    let (start, end) = if app.wrap {
+        wrap_window(&app.events, app.scroll, app.follow, log_h, inner_w)
+    } else {
+        let s = app.scroll;
+        (s, (s + log_h).min(app.events.len()))
+    };
     let lines: Vec<Line> = app.events[start..end]
         .iter()
         .map(|l| build_line(l.as_str()))
         .collect();
-    frame.render_widget(
-        Paragraph::new(Text::from(lines)).block(Block::bordered().title_top(Line::raw(" events "))),
-        log_area,
-    );
+    let mut para = Paragraph::new(Text::from(lines)).block(log_block);
+    if app.wrap {
+        para = para.wrap(Wrap { trim: false });
+    }
+    frame.render_widget(para, log_area);
 
     // --- footer ---
     frame.render_widget(
         Paragraph::new(Text::raw(
-            " q quit · j/k ↑↓ · PgUp/PgDn · g/G top/bottom · f follow · c clear ",
+            " q quit · j/k ↑↓ · PgUp/PgDn · g/G top/bottom · f follow · w wrap · c clear ",
         ))
         .block(Block::bordered()),
         foot_area,
     );
+}
+
+/// In wrap mode, pick the slice `[start, end)` of events to render so the
+/// viewport is filled with whole items (no row clipped mid-item): follow fills
+/// backward from the newest event; otherwise fill forward from the `scroll`
+/// anchor. `width` is the inner (post-border) column count.
+fn wrap_window(
+    events: &[String],
+    scroll: usize,
+    follow: bool,
+    log_h: usize,
+    width: usize,
+) -> (usize, usize) {
+    let n = events.len();
+    if n == 0 {
+        return (0, 0);
+    }
+    let height = |s: &str| {
+        Paragraph::new(build_line(s))
+            .wrap(Wrap { trim: false })
+            .line_count(width as u16)
+            .max(1)
+    };
+    let mut rows = 0usize;
+    if follow {
+        let mut start = n;
+        for (i, evt) in events.iter().enumerate().rev() {
+            let h = height(evt.as_str());
+            if rows != 0 && rows + h > log_h {
+                break;
+            }
+            rows += h;
+            start = i;
+            if rows >= log_h {
+                break;
+            }
+        }
+        (start, n)
+    } else {
+        let mut end = scroll;
+        for (i, evt) in events.iter().enumerate().skip(scroll) {
+            let h = height(evt.as_str());
+            if rows != 0 && rows + h > log_h {
+                break;
+            }
+            rows += h;
+            end = i + 1;
+            if rows >= log_h {
+                break;
+            }
+        }
+        (scroll, end)
+    }
 }
 
 /// Render a line with the direction symbol (`[F→B]`/`[B→F]`) highlighted in a
