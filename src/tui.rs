@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use ratatui::Frame;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Layout, Margin, Rect};
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Paragraph, Wrap};
@@ -149,7 +149,7 @@ fn app_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Result
         }
         app.scroll = app.scroll.min(max_scroll);
 
-        terminal.draw(|frame| draw(frame, &app, log_h))?;
+        terminal.draw(|frame| draw(frame, &app))?;
 
         if event::poll(Duration::from_millis(100))? {
             // Drain all currently-ready events without blocking on read().
@@ -206,7 +206,7 @@ fn handle_key(app: &mut App, log_h: usize, key: KeyEvent) -> bool {
     false
 }
 
-fn draw(frame: &mut Frame, app: &App, log_h: usize) {
+fn draw(frame: &mut Frame, app: &App) {
     let [title_area, log_area, foot_area] = Layout::vertical([
         Constraint::Length(3),
         Constraint::Fill(1),
@@ -227,23 +227,45 @@ fn draw(frame: &mut Frame, app: &App, log_h: usize) {
     frame.render_widget(Block::bordered().title_top(Line::raw(title)), title_area);
 
     // --- packet view ---
-    let start = app.scroll;
-    let end = (start + log_h).min(app.events.len());
+    // Render the bordered block, then each row as its own widget so the zebra
+    // background fills the whole line width (a Block fills its area with its
+    // style; a Paragraph alone only colours the cells under the text).
+    frame.render_widget(
+        Block::bordered()
+            .title_top(Line::raw(" packets "))
+            .border_style(Style::default().fg(Color::Green)),
+        log_area,
+    );
+    let inner = log_area.inner(Margin {
+        vertical: 1,
+        horizontal: 1,
+    });
+    let bottom = inner.bottom();
     let stripe = app.theme.stripe_color();
-    let mut lines: Vec<Line> = Vec::with_capacity(end - start);
-    for (i, line) in app.events[start..end].iter().enumerate() {
-        // Zebra striping by visible row so the bands stay put while scrolling.
-        let bg = (i % 2 == 1).then_some(stripe);
-        lines.push(build_line(line.as_str(), bg));
+    let mut y = inner.y;
+    for (vis, idx) in (app.scroll..app.events.len()).enumerate() {
+        if y >= bottom {
+            break;
+        }
+        let avail = bottom - y;
+        let mut para = Paragraph::new(build_line(app.events[idx].as_str()));
+        if app.wrap {
+            para = para.wrap(Wrap { trim: false });
+        }
+        // With wrap on an event may occupy several rows; otherwise one.
+        let h = if app.wrap {
+            (para.line_count(inner.width).max(1) as u16).min(avail)
+        } else {
+            1
+        };
+        let row = Rect::new(inner.x, y, inner.width, h);
+        // Odd visible rows get a full-width background; the text goes on top.
+        if vis % 2 == 1 {
+            frame.render_widget(Block::new().style(Style::default().bg(stripe)), row);
+        }
+        frame.render_widget(para, row);
+        y += h;
     }
-    let log_block = Block::bordered()
-        .title_top(Line::raw(" packets "))
-        .border_style(Style::default().fg(Color::Green));
-    let mut para = Paragraph::new(Text::from(lines)).block(log_block);
-    if app.wrap {
-        para = para.wrap(Wrap { trim: false });
-    }
-    frame.render_widget(para, log_area);
 
     // --- footer ---
     frame.render_widget(
@@ -258,17 +280,17 @@ fn draw(frame: &mut Frame, app: &App, log_h: usize) {
 /// Render a line with the direction symbol (`[F→B]`/`[B→F]`) highlighted in a
 /// high-contrast colour (F→B cyan, B→F magenta, bold) and the packet name
 /// (e.g. `Query`, `DataRow`) bold; all other text stays the default colour for
-/// easy reading. `bg` optionally paints a zebra-stripe background. Warnings
-/// stay red and connection notices yellow.
-fn build_line(line: &str, bg: Option<Color>) -> Line<'_> {
+/// easy reading. Warnings stay red and connection notices yellow. Row/zebra
+/// background is applied by the per-row widget in [`draw`].
+fn build_line(line: &str) -> Line<'_> {
     if line.contains('⚠') {
-        return Line::styled(line, with_bg(Style::default().fg(Color::Red), bg));
+        return Line::styled(line, Style::default().fg(Color::Red));
     }
     if line.contains("===") {
-        return Line::styled(line, with_bg(Style::default().fg(Color::Yellow), bg));
+        return Line::styled(line, Style::default().fg(Color::Yellow));
     }
     let Some((color, start, end)) = direction_split(line) else {
-        return Line::styled(line, with_bg(Style::default(), bg));
+        return Line::styled(line, Style::default());
     };
     // "[ts] [F→B] KIND: text" -> prefix | symbol | gap | kind | rest.
     // Skip the single space after the symbol closing bracket.
@@ -277,24 +299,13 @@ fn build_line(line: &str, bg: Option<Color>) -> Line<'_> {
         .find(": ")
         .map(|p| kind_start + p)
         .unwrap_or(line.len());
-    let mut l = Line::from(vec![
+    Line::from(vec![
         Span::raw(&line[..start]),
         Span::raw(&line[start..end]).fg(color).bold(),
         Span::raw(&line[end..kind_start]),
         Span::raw(&line[kind_start..kind_end]).bold(),
         Span::raw(&line[kind_end..]),
-    ]);
-    if let Some(c) = bg {
-        l = l.style(Style::default().bg(c));
-    }
-    l
-}
-
-fn with_bg(style: Style, bg: Option<Color>) -> Style {
-    match bg {
-        Some(c) => style.bg(c),
-        None => style,
-    }
+    ])
 }
 
 /// If `line` carries a direction tag, return `(colour, byte start, byte end)`
@@ -321,12 +332,12 @@ enum BgTheme {
 }
 
 impl BgTheme {
-    /// A subtle background for zebra striping: just-lighter-than-black on dark
-    /// themes, just-darker-than-white on light themes.
+    /// A subtle background for zebra striping: dark grey on dark themes,
+    /// light grey on light themes.
     fn stripe_color(self) -> Color {
         match self {
-            BgTheme::Dark => Color::Indexed(236),
-            BgTheme::Light => Color::Indexed(254),
+            BgTheme::Dark => Color::DarkGray,
+            BgTheme::Light => Color::Gray,
         }
     }
 }
