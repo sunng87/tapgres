@@ -296,9 +296,10 @@ fn draw(frame: &mut Frame, app: &App, view: &[&String], log_h: usize) {
     }
 }
 
-/// Build a styled line: warnings are red and connection notices yellow; for
-/// decoded messages the direction sets the colour (F→B cyan, B→F green) and
-/// the message name (e.g. `Query`, `DataRow`) is bold.
+/// Render a line with only the direction symbol (`[F→B]`/`[B→F]`) highlighted;
+/// everything else stays the default colour for easy reading. The two symbols
+/// use high-contrast colours (F→B cyan, B→F magenta) so direction is obvious at
+/// a glance. Warnings stay red and connection notices yellow.
 fn build_line(line: &str) -> Line<'_> {
     if line.contains('⚠') {
         return Line::styled(line, Style::default().fg(Color::Red));
@@ -306,28 +307,23 @@ fn build_line(line: &str) -> Line<'_> {
     if line.contains("===") {
         return Line::styled(line, Style::default().fg(Color::Yellow));
     }
-    let Some((color, after_tag)) = direction_split(line) else {
+    let Some((color, start, end)) = direction_split(line) else {
         return Line::styled(line, Style::default());
     };
-    // "[ts] [F→B] KIND[: rest]" -> prefix | kind | rest, bold the kind.
-    let kind_start = (after_tag + 1).min(line.len()); // skip the space after ']'
-    let kind_end = line[kind_start..]
-        .find(": ")
-        .map(|p| kind_start + p)
-        .unwrap_or(line.len());
+    // "[ts] [F→B] KIND: text" -> prefix | symbol | suffix
     Line::from(vec![
-        Span::raw(&line[..kind_start]).fg(color),
-        Span::raw(&line[kind_start..kind_end]).fg(color).bold(),
-        Span::raw(&line[kind_end..]).fg(color),
+        Span::raw(&line[..start]),
+        Span::raw(&line[start..end]).fg(color).bold(),
+        Span::raw(&line[end..]),
     ])
 }
 
-/// If `line` carries a direction tag, return its colour and the byte index just
-/// past the tag's closing `]`.
-fn direction_split(line: &str) -> Option<(Color, usize)> {
-    for (tag, color) in [("[F→B]", Color::Cyan), ("[B→F]", Color::Green)] {
-        if let Some(i) = line.find(tag) {
-            return Some((color, i + tag.len()));
+/// If `line` carries a direction tag, return `(colour, byte start, byte end)`
+/// of the tag. F→B is cyan, B→F is magenta — high contrast against each other.
+fn direction_split(line: &str) -> Option<(Color, usize, usize)> {
+    for (tag, color) in [("[F→B]", Color::Cyan), ("[B→F]", Color::Magenta)] {
+        if let Some(start) = line.find(tag) {
+            return Some((color, start, start + tag.len()));
         }
     }
     None
