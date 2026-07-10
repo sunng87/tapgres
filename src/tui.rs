@@ -20,8 +20,8 @@ use std::time::Duration;
 use ratatui::Frame;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout};
-use ratatui::style::{Color, Style};
-use ratatui::text::{Line, Text};
+use ratatui::style::{Color, Style, Stylize};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Paragraph};
 
 use crate::capture::PcapOpts;
@@ -267,7 +267,7 @@ fn draw(frame: &mut Frame, app: &App, view: &[&String], log_h: usize) {
     let end = (start + log_h).min(view.len());
     let lines: Vec<Line> = view[start..end]
         .iter()
-        .map(|l| Line::styled(l.as_str(), line_style(l)))
+        .map(|l| build_line(l.as_str()))
         .collect();
     frame.render_widget(
         Paragraph::new(Text::from(lines)).block(Block::bordered().title_top(Line::raw(" events "))),
@@ -296,18 +296,39 @@ fn draw(frame: &mut Frame, app: &App, view: &[&String], log_h: usize) {
     }
 }
 
-/// Colour a line by what it represents: warnings red, connection notices
-/// yellow, client→server cyan, server→client grey.
-fn line_style(line: &str) -> Style {
+/// Build a styled line: warnings are red and connection notices yellow; for
+/// decoded messages the direction sets the colour (F→B cyan, B→F green) and
+/// the message name (e.g. `Query`, `DataRow`) is bold.
+fn build_line(line: &str) -> Line<'_> {
     if line.contains('⚠') {
-        Style::default().fg(Color::Red)
-    } else if line.contains("===") {
-        Style::default().fg(Color::Yellow)
-    } else if line.contains("F→B") {
-        Style::default().fg(Color::Cyan)
-    } else if line.contains("B→F") {
-        Style::default().fg(Color::DarkGray)
-    } else {
-        Style::default()
+        return Line::styled(line, Style::default().fg(Color::Red));
     }
+    if line.contains("===") {
+        return Line::styled(line, Style::default().fg(Color::Yellow));
+    }
+    let Some((color, after_tag)) = direction_split(line) else {
+        return Line::styled(line, Style::default());
+    };
+    // "[ts] [F→B] KIND[: rest]" -> prefix | kind | rest, bold the kind.
+    let kind_start = (after_tag + 1).min(line.len()); // skip the space after ']'
+    let kind_end = line[kind_start..]
+        .find(": ")
+        .map(|p| kind_start + p)
+        .unwrap_or(line.len());
+    Line::from(vec![
+        Span::raw(&line[..kind_start]).fg(color),
+        Span::raw(&line[kind_start..kind_end]).fg(color).bold(),
+        Span::raw(&line[kind_end..]).fg(color),
+    ])
+}
+
+/// If `line` carries a direction tag, return its colour and the byte index just
+/// past the tag's closing `]`.
+fn direction_split(line: &str) -> Option<(Color, usize)> {
+    for (tag, color) in [("[F→B]", Color::Cyan), ("[B→F]", Color::Green)] {
+        if let Some(i) = line.find(tag) {
+            return Some((color, i + tag.len()));
+        }
+    }
+    None
 }
