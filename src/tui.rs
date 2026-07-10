@@ -2,14 +2,13 @@
 //!
 //! An orthogonal presentation layer over the existing traffic sources: the
 //! pcap capture or the mitm proxy runs in a background thread and feeds decoded
-//! lines onto a channel; the TUI drains them on the main
-//! thread and renders a scrollable, filterable view with [ratatui].
+//! lines onto a channel; the TUI drains them on the main thread and renders a
+//! scrollable view with [ratatui].
 //!
 //! First-cut controls:
 //! - `q` / `Ctrl-C` — quit
 //! - `j`/`k`, arrows, `PgUp`/`PgDn`, `g`/`G` — scroll
 //! - `f` — toggle follow (auto-tail)
-//! - `/` — filter by substring (`Enter` applies, `Esc` cancels)
 //! - `c` — clear
 
 use crossbeam_channel::Receiver;
@@ -92,12 +91,7 @@ fn run(
 struct App {
     rx: Receiver<Output>,
     events: Vec<String>,
-    /// Active substring filter (empty = none), case-insensitive.
-    filter: String,
-    /// Buffer being typed while in filter mode.
-    filter_buf: String,
-    filtering: bool,
-    /// Index of the top visible line into the filtered view.
+    /// Index of the top visible line into the event buffer.
     scroll: usize,
     /// Auto-tail new output.
     follow: bool,
@@ -109,28 +103,11 @@ impl App {
         Self {
             rx,
             events: Vec::new(),
-            filter: String::new(),
-            filter_buf: String::new(),
-            filtering: false,
             scroll: 0,
             follow: true,
             mode,
         }
     }
-}
-
-/// Lines passing `filter` (empty = all). A free function (not a method) so the
-/// returned borrows are tied only to `events`, leaving `App`'s other fields
-/// (e.g. `scroll`) free to mutate while the view is live.
-fn filtered<'a>(events: &'a [String], filter: &str) -> Vec<&'a String> {
-    if filter.is_empty() {
-        return events.iter().collect();
-    }
-    let needle = filter.to_lowercase();
-    events
-        .iter()
-        .filter(|l| l.to_lowercase().contains(&needle))
-        .collect()
 }
 
 fn app_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Result<()> {
@@ -150,14 +127,13 @@ fn app_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Result
         let term_h = terminal.size()?.height as usize;
         let log_h = term_h.saturating_sub(8).max(1);
 
-        let view = filtered(&app.events, &app.filter);
-        let max_scroll = view.len().saturating_sub(log_h);
+        let max_scroll = app.events.len().saturating_sub(log_h);
         if app.follow {
             app.scroll = max_scroll;
         }
         app.scroll = app.scroll.min(max_scroll);
 
-        terminal.draw(|frame| draw(frame, &app, &view, log_h))?;
+        terminal.draw(|frame| draw(frame, &app, log_h))?;
 
         if event::poll(Duration::from_millis(100))? {
             // Drain all currently-ready events without blocking on read().
@@ -181,26 +157,6 @@ fn app_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Result
 
 /// Handle one key. Returns `true` to quit.
 fn handle_key(app: &mut App, log_h: usize, key: KeyEvent) -> bool {
-    if app.filtering {
-        match key.code {
-            KeyCode::Esc => {
-                app.filtering = false;
-                app.filter_buf.clear();
-            }
-            KeyCode::Enter => {
-                app.filter = std::mem::take(&mut app.filter_buf);
-                app.filtering = false;
-                app.follow = true;
-            }
-            KeyCode::Backspace => {
-                app.filter_buf.pop();
-            }
-            KeyCode::Char(c) if !c.is_control() => app.filter_buf.push(c),
-            _ => {}
-        }
-        return false;
-    }
-
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {
         KeyCode::Char('c') if ctrl => return true,
@@ -228,16 +184,12 @@ fn handle_key(app: &mut App, log_h: usize, key: KeyEvent) -> bool {
         }
         KeyCode::Char('f') => app.follow = !app.follow,
         KeyCode::Char('c') => app.events.clear(),
-        KeyCode::Char('/') => {
-            app.filtering = true;
-            app.filter_buf.clear();
-        }
         _ => {}
     }
     false
 }
 
-fn draw(frame: &mut Frame, app: &App, view: &[&String], log_h: usize) {
+fn draw(frame: &mut Frame, app: &App, log_h: usize) {
     let [title_area, log_area, foot_area] = Layout::vertical([
         Constraint::Length(3),
         Constraint::Fill(1),
@@ -246,26 +198,19 @@ fn draw(frame: &mut Frame, app: &App, view: &[&String], log_h: usize) {
     .areas(frame.area());
 
     // --- title bar ---
-    let filter_tag = if app.filter.is_empty() {
-        String::new()
-    } else {
-        format!(" · filter {:?} ", app.filter)
-    };
     let follow_tag = if app.follow { " · following" } else { "" };
     let title = format!(
-        " tapgres — {} mode · {} events ({} shown){}{} ",
+        " tapgres — {} mode · {} events{} ",
         app.mode,
         app.events.len(),
-        view.len(),
-        filter_tag,
-        follow_tag,
+        follow_tag
     );
     frame.render_widget(Block::bordered().title_top(Line::raw(title)), title_area);
 
     // --- log ---
     let start = app.scroll;
-    let end = (start + log_h).min(view.len());
-    let lines: Vec<Line> = view[start..end]
+    let end = (start + log_h).min(app.events.len());
+    let lines: Vec<Line> = app.events[start..end]
         .iter()
         .map(|l| build_line(l.as_str()))
         .collect();
@@ -275,25 +220,13 @@ fn draw(frame: &mut Frame, app: &App, view: &[&String], log_h: usize) {
     );
 
     // --- footer ---
-    if app.filtering {
-        let prefix = " filter: ";
-        frame.render_widget(
-            Paragraph::new(Text::raw(format!("{prefix}{}", app.filter_buf)))
-                .block(Block::bordered().title_top(Line::raw(" / "))),
-            foot_area,
-        );
-        let cx = foot_area.x + 1 + prefix.len() as u16 + app.filter_buf.len() as u16;
-        let cy = foot_area.y + 1;
-        frame.set_cursor_position((cx.min(foot_area.right().saturating_sub(1)), cy));
-    } else {
-        frame.render_widget(
-            Paragraph::new(Text::raw(
-                " q quit · j/k ↑↓ · PgUp/PgDn · g/G top/bottom · f follow · / filter · c clear ",
-            ))
-            .block(Block::bordered()),
-            foot_area,
-        );
-    }
+    frame.render_widget(
+        Paragraph::new(Text::raw(
+            " q quit · j/k ↑↓ · PgUp/PgDn · g/G top/bottom · f follow · c clear ",
+        ))
+        .block(Block::bordered()),
+        foot_area,
+    );
 }
 
 /// Render a line with the direction symbol (`[F→B]`/`[B→F]`) highlighted in a

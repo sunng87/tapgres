@@ -12,7 +12,7 @@ sources, selected with `--mode`, and an optional interactive view with `--tui`:
 - **`mitm`**: runs a local TLS-terminating proxy so you can decode **encrypted**
   sessions too. Point your client at the proxy; it decrypts the client leg,
   decodes in the middle, and forwards to the real server.
-- **`--tui`**: render either source as an interactive, scrollable, filterable
+- **`--tui`**: render either source as an interactive, scrollable
   full-screen view instead of line-oriented stdout.
 
 `F→B` is the client (frontend) → server (backend); `B→F` is the reverse.
@@ -84,9 +84,9 @@ the upstream certificate — it assumes a local, operator-controlled server.
 
 ## Interactive TUI (`--tui`)
 
-Add `--tui` to either mode for a full-screen, scrollable, filterable view
-instead of line-oriented stdout. The chosen source runs in a background thread
-and feeds the TUI on the main thread:
+Add `--tui` to either mode for a full-screen, scrollable view instead of
+line-oriented stdout. The chosen source runs in a background thread and feeds
+the TUI on the main thread:
 
 ```
 tapgres --tui                              # pcap source, interactive view
@@ -101,11 +101,11 @@ Keybindings:
 | `j`/`k`, arrows, `PgUp`/`PgDn` | scroll |
 | `g` / `G` | top / bottom |
 | `f` | toggle follow (auto-tail) |
-| `/` | filter by substring (`Enter` applies, `Esc` cancels) |
 | `c` | clear |
 
-Lines are coloured by direction (`F→B` cyan, `B→F` grey; connection notices
-yellow; warnings red). `--tui` with `pcap` still needs capture privileges.
+The direction symbol is highlighted in a high-contrast colour (`[F→B]` cyan,
+`[B→F]` magenta) and the packet name is bold; warnings are red and connection
+notices yellow. `--tui` with `pcap` still needs capture privileges.
 
 ## Install
 
