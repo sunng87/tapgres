@@ -496,7 +496,35 @@ fn format_bind(b: &Bind) -> String {
             }
         })
         .collect();
-    format!("{}  <-  {}  params: [{}]", portal, stmt, params.join(", "))
+    format!(
+        "{}  <-  {}  params: [{}]  result: {}",
+        portal,
+        stmt,
+        params.join(", "),
+        format_format_codes(&b.result_column_format_codes),
+    )
+}
+
+/// Render format codes (text=0, binary=1) compactly: `text`, `binary`, or a
+/// per-column `[text, binary, ...]`.
+fn format_format_codes(codes: &[i16]) -> String {
+    if codes.is_empty() || codes.iter().all(|&c| c == FORMAT_CODE_TEXT) {
+        "text".to_string()
+    } else if codes.iter().all(|&c| c == FORMAT_CODE_BINARY) {
+        "binary".to_string()
+    } else {
+        let parts: Vec<&str> = codes
+            .iter()
+            .map(|&c| {
+                if c == FORMAT_CODE_BINARY {
+                    "binary"
+                } else {
+                    "text"
+                }
+            })
+            .collect();
+        format!("[{}]", parts.join(", "))
+    }
 }
 
 fn format_describe_close(target_type: u8, name: &Option<String>) -> String {
