@@ -112,8 +112,10 @@ notices yellow. The metrics header shows open/total connections, current
 in/out packet and byte rates, and a 60-second aggregate throughput sparkline.
 Closed connection records and their final counters are retained for future
 filtering (10,000 by default). Tune these bounds with `--conn-history` and
-`--rate-history`. The packet view has a green border. `--tui` with `pcap`
-still needs capture privileges.
+`--rate-history`. Packet counts are source-specific: pcap counts captured TCP
+segments, including control packets, while MITM counts plaintext logical reads.
+The packet view has a green border. `--tui` with `pcap` still needs capture
+privileges.
 
 ## Install
 

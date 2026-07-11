@@ -261,6 +261,12 @@ impl Metrics {
     /// Start the aggregate one-second sampler. Dropping the returned guard
     /// stops and joins the thread without waiting for the next tick.
     pub fn spawn_rate_sampler(self: &Arc<Self>) -> std::io::Result<RateSampler> {
+        if self.rate_history == 0 {
+            return Ok(RateSampler {
+                stop: None,
+                thread: None,
+            });
+        }
         self.spawn_rate_sampler_every(Duration::from_secs(1))
     }
 
@@ -411,5 +417,13 @@ mod tests {
         }
         assert_eq!(metrics.summary().rates[0].bytes_in, 12);
         drop(sampler);
+    }
+
+    #[test]
+    fn disabled_rate_history_does_not_start_a_thread() {
+        let metrics = Arc::new(Metrics::with_limits(10, 0));
+        let sampler = metrics.spawn_rate_sampler().unwrap();
+        assert!(sampler.stop.is_none());
+        assert!(sampler.thread.is_none());
     }
 }

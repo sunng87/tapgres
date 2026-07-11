@@ -138,6 +138,9 @@ pub struct Connection {
     /// Set when the client negotiated SSL/GSS — the stream is then encrypted
     /// and we can no longer decode it.
     encrypted: bool,
+    /// Metrics close on the first FIN, while the flow entry remains to absorb
+    /// the rest of the TCP close handshake.
+    metrics_closed: bool,
     stats: Arc<ConnStats>,
 }
 
@@ -147,6 +150,7 @@ impl Connection {
             client: Direction::new(Role::Client),
             server: Direction::new(Role::Server),
             encrypted: false,
+            metrics_closed: false,
             stats,
         }
     }
@@ -209,6 +213,9 @@ impl Default for ConnTable {
 }
 
 impl ConnTable {
+    /// Construct an isolated table with an internal metrics store. Production
+    /// sources use [`ConnTable::with_metrics`]; this convenience is primarily
+    /// useful for decode/reassembly tests.
     pub fn new() -> Self {
         Self::with_metrics(Arc::new(Metrics::new()))
     }
@@ -233,8 +240,14 @@ impl ConnTable {
 
         let key = ConnKey { client, server };
 
-        let is_new = !self.map.contains_key(&key);
-        if is_new {
+        // A closed entry stays in the map after FIN to absorb the trailing
+        // ACK/FIN/ACK packets. A later SYN on the same 4-tuple is a genuine
+        // reuse and starts fresh decode and metrics state.
+        let should_open = self
+            .map
+            .get(&key)
+            .is_none_or(|conn| seg.syn && conn.metrics_closed);
+        if should_open {
             decode::out(format!(
                 "[{}] === new connection  {}:{}  ->  {}:{}  (port {}) ===",
                 decode::ts(),
@@ -265,15 +278,14 @@ impl ConnTable {
 
         if let Some(conn) = self.map.get_mut(&key) {
             conn.handle(seg, pg_port, &self.metrics);
-        }
-        if seg.fin
-            && let Some(conn) = self.map.remove(&key)
-        {
-            decode::out(format!(
-                "[{}] === connection closed (FIN) ===",
-                decode::ts()
-            ));
-            self.metrics.close_connection(&conn.stats);
+            if seg.fin && !conn.metrics_closed {
+                conn.metrics_closed = true;
+                decode::out(format!(
+                    "[{}] === connection closed (FIN) ===",
+                    decode::ts()
+                ));
+                self.metrics.close_connection(&conn.stats);
+            }
         }
     }
 }
@@ -284,33 +296,90 @@ mod tests {
     use crate::state::ConnectionLifecycle;
     use std::net::{IpAddr, Ipv4Addr};
 
-    #[test]
-    fn pcap_connection_is_retained_after_fin() {
-        let metrics = Arc::new(Metrics::new());
-        let mut table = ConnTable::with_metrics(metrics.clone());
-        let segment = TcpSegment {
-            src: IpAddr::V4(Ipv4Addr::LOCALHOST),
-            dst: IpAddr::V4(Ipv4Addr::LOCALHOST),
-            src_port: 40_000,
-            dst_port: 5432,
+    const CLIENT_PORT: u16 = 40_000;
+    const PG_PORT: u16 = 5432;
+
+    fn segment(client_to_server: bool, syn: bool, fin: bool, payload: &[u8]) -> TcpSegment {
+        let host = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let (src_port, dst_port) = if client_to_server {
+            (CLIENT_PORT, PG_PORT)
+        } else {
+            (PG_PORT, CLIENT_PORT)
+        };
+        TcpSegment {
+            src: host,
+            dst: host,
+            src_port,
+            dst_port,
             seq: 1,
             ack: 0,
-            syn: true,
-            fin: true,
+            syn,
+            fin,
             rst: false,
-            payload: vec![1, 2, 3],
-        };
-        table.handle(&segment, 5432);
+            payload: payload.to_vec(),
+        }
+    }
+
+    fn clean_close(table: &mut ConnTable) {
+        table.handle(&segment(true, true, false, &[]), PG_PORT); // SYN
+        table.handle(&segment(false, true, false, &[]), PG_PORT); // SYN/ACK
+        table.handle(&segment(true, false, false, &[]), PG_PORT); // ACK
+        table.handle(&segment(true, false, true, &[]), PG_PORT); // FIN
+        table.handle(&segment(false, false, false, &[]), PG_PORT); // ACK
+        table.handle(&segment(false, false, true, &[]), PG_PORT); // FIN
+        table.handle(&segment(true, false, false, &[]), PG_PORT); // ACK
+    }
+
+    #[test]
+    fn full_close_handshake_does_not_create_phantom_connections() {
+        let metrics = Arc::new(Metrics::new());
+        let mut table = ConnTable::with_metrics(metrics.clone());
+        clean_close(&mut table);
 
         let snapshot = metrics.snapshot();
         assert_eq!(snapshot.conns_opened, 1);
         assert_eq!(snapshot.conns_live, 0);
-        assert_eq!(snapshot.pkts_in, 1);
-        assert_eq!(snapshot.bytes_in, 3);
+        assert_eq!(snapshot.pkts_in, 4);
+        assert_eq!(snapshot.pkts_out, 3);
         assert_eq!(snapshot.connections.len(), 1);
+        assert_eq!(table.map.len(), 1);
         assert!(matches!(
             snapshot.connections[0].lifecycle,
             ConnectionLifecycle::Closed { .. }
         ));
+    }
+
+    #[test]
+    fn mid_capture_connection_still_opens_without_syn() {
+        let metrics = Arc::new(Metrics::new());
+        let mut table = ConnTable::with_metrics(metrics.clone());
+        table.handle(&segment(true, false, false, &[1, 2, 3]), PG_PORT);
+        table.handle(&segment(false, false, true, &[]), PG_PORT);
+        table.handle(&segment(true, false, false, &[]), PG_PORT);
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.conns_opened, 1);
+        assert_eq!(snapshot.conns_live, 0);
+        assert_eq!(snapshot.connections.len(), 1);
+        assert_eq!(snapshot.connections[0].bytes_in, 3);
+    }
+
+    #[test]
+    fn syn_reopens_a_closed_four_tuple() {
+        let metrics = Arc::new(Metrics::new());
+        let mut table = ConnTable::with_metrics(metrics.clone());
+        clean_close(&mut table);
+        table.handle(&segment(true, true, false, &[]), PG_PORT);
+
+        let open = metrics.snapshot();
+        assert_eq!(open.conns_opened, 2);
+        assert_eq!(open.conns_live, 1);
+        assert_eq!(open.connections.len(), 2);
+
+        table.handle(&segment(true, false, true, &[]), PG_PORT);
+        let closed = metrics.snapshot();
+        assert_eq!(closed.conns_opened, 2);
+        assert_eq!(closed.conns_live, 0);
+        assert_eq!(closed.connections.len(), 2);
     }
 }

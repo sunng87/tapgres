@@ -138,6 +138,8 @@ async fn handle_connection(
 ) -> io::Result<()> {
     let client_endpoint = client.peer_addr()?;
     let proxy_endpoint = client.local_addr()?;
+    // `encrypted` means opaque to tapgres. MITM transport encryption is
+    // terminated here, so successfully relayed traffic remains decodable.
     let stats = metrics.open_connection(client_endpoint, proxy_endpoint, false);
     let _connection_guard = ConnectionGuard {
         metrics: metrics.clone(),
@@ -148,7 +150,6 @@ async fn handle_connection(
     if client.read_exact(&mut head).await.is_err() {
         return Ok(()); // client sent < 8 bytes (or nothing); nothing to tap
     }
-    metrics.record(&stats, TrafficDirection::In, head.len());
     let body = &head[4..8];
 
     // Cancel requests are one-shot, raw, and must reach the server verbatim on
@@ -161,7 +162,6 @@ async fn handle_connection(
 
     // --- Decide the client-facing transport ---
     let client_tls = body == SSL_MAGIC;
-    metrics.set_encrypted(&stats, client_tls);
     let initial: Vec<u8> = if client_tls {
         client.write_all(b"S").await?; // accept SSL locally
         Vec::new()
@@ -173,6 +173,11 @@ async fn handle_connection(
         // Cleartext Startup (or anything else): these 8 bytes begin it.
         head.to_vec()
     };
+    if !initial.is_empty() {
+        // Count the cleartext Startup read. SSL/GSS negotiation and TLS
+        // handshake bytes are transport overhead outside the application edge.
+        metrics.record(&stats, TrafficDirection::In, initial.len());
+    }
 
     let client_stream: ProxyStream = if client_tls {
         let acceptor = TlsAcceptor::from(tls.server_config.clone());
@@ -265,6 +270,8 @@ async fn pump(
             let _ = to.shutdown().await;
             return Ok(());
         }
+        // MITM packets are logical reads. Bytes consumed inside the TLS
+        // wrappers are intentionally outside these application-edge counters.
         metrics.record(
             &stats,
             if role == Role::Client {
