@@ -18,10 +18,11 @@
 use std::error::Error;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::{Parser, ValueEnum};
 
-use tapgres::{capture, decode, proxy, tui};
+use tapgres::{capture, decode, proxy, state, tui};
 
 pub(crate) const BANNER: &str = "
 ████████╗ █████╗ ██████╗  ██████╗ ██████╗ ███████╗███████╗
@@ -47,6 +48,15 @@ struct Args {
     /// Interactive TUI instead of line-oriented stdout (works with any --mode).
     #[arg(long, default_value_t = false)]
     tui: bool,
+
+    /// Maximum retained open + recently-closed connection records.
+    /// Open connections are never evicted.
+    #[arg(long, default_value_t = state::DEFAULT_CONNECTION_CAP)]
+    conn_history: usize,
+
+    /// Number of one-second aggregate rate samples retained for the TUI.
+    #[arg(long, default_value_t = state::DEFAULT_RATE_HISTORY)]
+    rate_history: usize,
 
     // --- pcap mode ---------------------------------------------------------
     /// [pcap] PostgreSQL TCP port to monitor.
@@ -102,6 +112,10 @@ enum Mode {
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
+    let metrics = Arc::new(state::Metrics::with_limits(
+        args.conn_history,
+        args.rate_history,
+    ));
     match args.mode {
         Mode::Pcap => {
             let opts = capture::PcapOpts {
@@ -111,9 +125,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                 snaplen: args.snaplen,
             };
             if args.tui {
-                tui::run_pcap(opts)
+                tui::run_pcap(opts, metrics)
             } else {
-                run_stdout(move || capture::run(opts))
+                run_stdout(move || capture::run(opts, metrics))
             }
         }
         Mode::Mitm => {
@@ -126,9 +140,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                 no_upstream_tls: args.no_upstream_tls,
             };
             if args.tui {
-                tui::run_mitm(opts)
+                tui::run_mitm(opts, metrics)
             } else {
-                run_stdout(move || proxy::run(opts))
+                run_stdout(move || proxy::run(opts, metrics))
             }
         }
     }

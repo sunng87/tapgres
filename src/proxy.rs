@@ -28,6 +28,7 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use crate::decode::{self, DrainOutcome};
 use crate::flow::{Direction, Role};
+use crate::state::{ConnStats, Metrics, TrafficDirection};
 
 /// Postgres protocol negotiation magics (the 4 bytes after the 8-byte length).
 const SSL_MAGIC: [u8; 4] = [0x04, 0xd2, 0x16, 0x2f]; // 80877103 SSLRequest
@@ -62,16 +63,29 @@ struct TlsMaterial {
     ca_cert_path: Option<PathBuf>,
 }
 
+/// Ensures accepted connections are closed in the registry on every return
+/// path, including handshake and upstream-connect failures.
+struct ConnectionGuard {
+    metrics: Arc<Metrics>,
+    stats: Arc<ConnStats>,
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.metrics.close_connection(&self.stats);
+    }
+}
+
 /// Entry point for `--mode mitm`. Builds a multi-thread tokio runtime and runs
 /// the proxy until interrupted.
-pub fn run(opts: ProxyOpts) -> Result<(), Box<dyn Error>> {
+pub fn run(opts: ProxyOpts, metrics: Arc<Metrics>) -> Result<(), Box<dyn Error>> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    rt.block_on(serve(opts))
+    rt.block_on(serve(opts, metrics))
 }
 
-pub async fn serve(opts: ProxyOpts) -> Result<(), Box<dyn Error>> {
+pub async fn serve(opts: ProxyOpts, metrics: Arc<Metrics>) -> Result<(), Box<dyn Error>> {
     let tls = Arc::new(materialize_tls(&opts)?);
 
     match &tls.ca_cert_path {
@@ -106,8 +120,9 @@ pub async fn serve(opts: ProxyOpts) -> Result<(), Box<dyn Error>> {
         let (client, peer) = listener.accept().await?;
         let opts = opts.clone();
         let tls = tls.clone();
+        let metrics = metrics.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(client, opts, tls).await {
+            if let Err(e) = handle_connection(client, opts, tls, metrics).await {
                 decode::status(format!("tapgres: connection from {peer}: {e}"));
             }
         });
@@ -119,12 +134,21 @@ async fn handle_connection(
     mut client: TcpStream,
     opts: Arc<ProxyOpts>,
     tls: Arc<TlsMaterial>,
+    metrics: Arc<Metrics>,
 ) -> io::Result<()> {
+    let client_endpoint = client.peer_addr()?;
+    let proxy_endpoint = client.local_addr()?;
+    let stats = metrics.open_connection(client_endpoint, proxy_endpoint, false);
+    let _connection_guard = ConnectionGuard {
+        metrics: metrics.clone(),
+        stats: stats.clone(),
+    };
     // Read the first 8 bytes: 4-byte length + 4-byte magic/protocol.
     let mut head = [0u8; 8];
     if client.read_exact(&mut head).await.is_err() {
         return Ok(()); // client sent < 8 bytes (or nothing); nothing to tap
     }
+    metrics.record(&stats, TrafficDirection::In, head.len());
     let body = &head[4..8];
 
     // Cancel requests are one-shot, raw, and must reach the server verbatim on
@@ -137,6 +161,7 @@ async fn handle_connection(
 
     // --- Decide the client-facing transport ---
     let client_tls = body == SSL_MAGIC;
+    metrics.set_encrypted(&stats, client_tls);
     let initial: Vec<u8> = if client_tls {
         client.write_all(b"S").await?; // accept SSL locally
         Vec::new()
@@ -185,12 +210,30 @@ async fn handle_connection(
     // Bidirectional decode + relay.
     let (client_rd, client_wr) = tokio::io::split(client_stream);
     let (server_rd, server_wr) = tokio::io::split(server_stream);
-    let mut to_client = tokio::spawn(pump(server_rd, client_wr, Role::Server));
-    let mut to_server = tokio::spawn(pump(client_rd, server_wr, Role::Client));
+    let mut to_client = tokio::spawn(pump(
+        server_rd,
+        client_wr,
+        Role::Server,
+        metrics.clone(),
+        stats.clone(),
+    ));
+    let mut to_server = tokio::spawn(pump(
+        client_rd,
+        server_wr,
+        Role::Client,
+        metrics.clone(),
+        stats.clone(),
+    ));
     // Finish as soon as either side closes; abort the other half.
     tokio::select! {
-        _ = &mut to_client => { to_server.abort(); }
-        _ = &mut to_server => { to_client.abort(); }
+        _ = &mut to_client => {
+            to_server.abort();
+            let _ = to_server.await;
+        }
+        _ = &mut to_server => {
+            to_client.abort();
+            let _ = to_client.await;
+        }
     }
     Ok(())
 }
@@ -211,6 +254,8 @@ async fn pump(
     mut from: tokio::io::ReadHalf<ProxyStream>,
     mut to: tokio::io::WriteHalf<ProxyStream>,
     role: Role,
+    metrics: Arc<Metrics>,
+    stats: Arc<ConnStats>,
 ) -> io::Result<()> {
     let mut dir = Direction::for_decoding(role);
     let mut buf = vec![0u8; 16 * 1024];
@@ -220,6 +265,15 @@ async fn pump(
             let _ = to.shutdown().await;
             return Ok(());
         }
+        metrics.record(
+            &stats,
+            if role == Role::Client {
+                TrafficDirection::In
+            } else {
+                TrafficDirection::Out
+            },
+            n,
+        );
         // Decode the freshly arrived plaintext (the decoder buffers partial
         // messages across calls), then forward the bytes untouched.
         dir.rxbuf.extend_from_slice(&buf[..n]);

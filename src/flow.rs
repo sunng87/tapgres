@@ -6,13 +6,15 @@
 //! message decoder.
 
 use std::collections::{BTreeMap, HashMap};
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 
 use bytes::BytesMut;
 use pgwire::messages::DecodeContext;
 
 use crate::decode::{self, FieldSummary};
 use crate::net::TcpSegment;
+use crate::state::{ConnStats, Metrics, TrafficDirection};
 
 /// (ip, port)
 pub type Endpoint = (IpAddr, u16);
@@ -136,18 +138,29 @@ pub struct Connection {
     /// Set when the client negotiated SSL/GSS — the stream is then encrypted
     /// and we can no longer decode it.
     encrypted: bool,
+    stats: Arc<ConnStats>,
 }
 
 impl Connection {
-    fn new() -> Self {
+    fn new(stats: Arc<ConnStats>) -> Self {
         Self {
             client: Direction::new(Role::Client),
             server: Direction::new(Role::Server),
             encrypted: false,
+            stats,
         }
     }
 
-    fn handle(&mut self, seg: &TcpSegment, pg_port: u16) {
+    fn handle(&mut self, seg: &TcpSegment, pg_port: u16, metrics: &Metrics) {
+        metrics.record(
+            &self.stats,
+            if seg.dst_port == pg_port {
+                TrafficDirection::In
+            } else {
+                TrafficDirection::Out
+            },
+            seg.payload.len(),
+        );
         if self.encrypted {
             return;
         }
@@ -178,6 +191,7 @@ impl Connection {
         }
         if outcome.encrypted {
             self.encrypted = true;
+            metrics.set_encrypted(&self.stats, true);
         }
     }
 }
@@ -185,6 +199,7 @@ impl Connection {
 /// The table of all active connections seen on the wire.
 pub struct ConnTable {
     map: HashMap<ConnKey, Connection>,
+    metrics: Arc<Metrics>,
 }
 
 impl Default for ConnTable {
@@ -195,8 +210,13 @@ impl Default for ConnTable {
 
 impl ConnTable {
     pub fn new() -> Self {
+        Self::with_metrics(Arc::new(Metrics::new()))
+    }
+
+    pub fn with_metrics(metrics: Arc<Metrics>) -> Self {
         Self {
             map: HashMap::new(),
+            metrics,
         }
     }
 
@@ -224,17 +244,73 @@ impl ConnTable {
                 server.1,
                 pg_port,
             ));
-            self.map.insert(key, Connection::new());
+            let stats = self.metrics.open_connection(
+                SocketAddr::new(client.0, client.1),
+                SocketAddr::new(server.0, server.1),
+                false,
+            );
+            self.map.insert(key, Connection::new(stats));
         }
 
         if seg.rst {
+            if let Some(conn) = self.map.get_mut(&key) {
+                conn.handle(seg, pg_port, &self.metrics);
+            }
             decode::out(format!("[{}] === connection reset (RST) ===", decode::ts()));
-            self.map.remove(&key);
+            if let Some(conn) = self.map.remove(&key) {
+                self.metrics.close_connection(&conn.stats);
+            }
             return;
         }
 
         if let Some(conn) = self.map.get_mut(&key) {
-            conn.handle(seg, pg_port);
+            conn.handle(seg, pg_port, &self.metrics);
         }
+        if seg.fin
+            && let Some(conn) = self.map.remove(&key)
+        {
+            decode::out(format!(
+                "[{}] === connection closed (FIN) ===",
+                decode::ts()
+            ));
+            self.metrics.close_connection(&conn.stats);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::ConnectionLifecycle;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    #[test]
+    fn pcap_connection_is_retained_after_fin() {
+        let metrics = Arc::new(Metrics::new());
+        let mut table = ConnTable::with_metrics(metrics.clone());
+        let segment = TcpSegment {
+            src: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            dst: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            src_port: 40_000,
+            dst_port: 5432,
+            seq: 1,
+            ack: 0,
+            syn: true,
+            fin: true,
+            rst: false,
+            payload: vec![1, 2, 3],
+        };
+        table.handle(&segment, 5432);
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.conns_opened, 1);
+        assert_eq!(snapshot.conns_live, 0);
+        assert_eq!(snapshot.pkts_in, 1);
+        assert_eq!(snapshot.bytes_in, 3);
+        assert_eq!(snapshot.connections.len(), 1);
+        assert!(matches!(
+            snapshot.connections[0].lifecycle,
+            ConnectionLifecycle::Closed { .. }
+        ));
     }
 }

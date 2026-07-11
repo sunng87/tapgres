@@ -9,12 +9,14 @@
 //! the TUI.
 
 use std::error::Error;
+use std::sync::Arc;
 
 use pcap::{Capture, Device};
 
 use crate::decode;
 use crate::flow;
 use crate::net;
+use crate::state::Metrics;
 
 /// Options for a passive capture. Cheap to clone so the TUI can move a copy
 /// into a background thread.
@@ -31,7 +33,7 @@ pub struct PcapOpts {
 }
 
 /// Run the capture + decode loop until the capture ends or errors.
-pub fn run(opts: PcapOpts) -> Result<(), Box<dyn Error>> {
+pub fn run(opts: PcapOpts, metrics: Arc<Metrics>) -> Result<(), Box<dyn Error>> {
     let device = resolve_device(opts.interface.as_deref())?;
 
     decode::status(format!(
@@ -57,7 +59,7 @@ pub fn run(opts: PcapOpts) -> Result<(), Box<dyn Error>> {
         datalink_name(dlt)
     ));
 
-    let mut table = flow::ConnTable::new();
+    let mut table = flow::ConnTable::with_metrics(metrics);
     loop {
         match cap.next_packet() {
             Ok(packet) => {
