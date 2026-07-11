@@ -111,13 +111,63 @@ The direction symbol is highlighted in a high-contrast colour (`[F→B]` cyan,
 notices yellow. The packet view has a green border. `--tui` with `pcap` still
 needs capture privileges.
 
-## Install
+## Installation
+
+### Prebuilt binary (GitHub Releases)
+
+Each tagged release publishes a Linux x86_64 binary built by the
+[release workflow](.github/workflows/release.yml). Download it from the
+[releases page](https://github.com/sunng87/tapgres/releases):
 
 ```sh
-# Nix
-nix build && ./result/bin/tapgres --help
+curl -L -o tapgres https://github.com/sunng87/tapgres/releases/latest/download/tapgres-linux-x86_64
+chmod +x tapgres
+sudo mv tapgres /usr/local/bin/
+```
 
-# Cargo (libpcap must be installed, e.g. libpcap-dev on Debian/Ubuntu)
+The binary is built with Nix, so on a non-Nix Linux it needs `libpcap.so.1`
+reachable via the library path (`libpcap` from your distro). On Arch this is
+taken care of by the package below.
+
+### Arch Linux (AUR)
+
+```sh
+paru -S tapgres-bin        # or: yay -S tapgres-bin
+tapgres --help
+```
+
+`tapgres-bin` wraps the release binary, repoints its ELF interpreter to the
+system loader, and depends on `libpcap`.
+
+### Nix (flake)
+
+Run once, without installing:
+
+```sh
+nix run github:sunng87/tapgres -- --help
+```
+
+Install into your user profile:
+
+```sh
+nix profile install github:sunng87/tapgres
+```
+
+Or build locally and run the result:
+
+```sh
+nix build && ./result/bin/tapgres --help
+```
+
+To consume it from another flake, add it to your inputs and reference
+`tapgres.packages.${system}.default`.
+
+### Build from source (Cargo)
+
+libpcap must be installed (e.g. `libpcap-dev` on Debian/Ubuntu,
+`libpcap` on Arch/Homebrew):
+
+```sh
 cargo install --path .
 ```
 

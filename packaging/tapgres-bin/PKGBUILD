@@ -6,6 +6,7 @@ pkgdesc="Passively tap a local PostgreSQL port and decode its wire traffic to st
 arch=('x86_64')
 url="https://github.com/sunng87/tapgres"
 provides=('tapgres')
+conflicts=('tapgres')
 license=('MIT')
 depends=('glibc' 'gcc-libs' 'libpcap')
 makedepends=('patchelf')

@@ -33,21 +33,42 @@ jobs:
           prerelease: false
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Get SHA256 checksum
+      - name: Get SHA256 checksums
         id: sha256
-        run: echo "sha256=$(sha256sum tapgres-linux-x86_64 | awk '{print $1}')" >> $GITHUB_OUTPUT
-
-      - name: Update PKGBUILD
         run: |
           version=${GITHUB_REF_NAME#v}
-          sed -i "s/^pkgver=.*/pkgver=$version/" PKGBUILD
-          sed -i "s/^sha256sums=.*/sha256sums=('${{ steps.sha256.outputs.sha256 }}')/" PKGBUILD
+          binary_sha=$(sha256sum tapgres-linux-x86_64 | awk '{print $1}')
+          source_sha=$(curl -fsSL https://github.com/${{ github.repository }}/archive/refs/tags/${GITHUB_REF_NAME}.tar.gz | sha256sum | awk '{print $1}')
+          {
+            echo "version=$version"
+            echo "binary=$binary_sha"
+            echo "source=$source_sha"
+          } >> "$GITHUB_OUTPUT"
 
-      - name: Deploy to AUR
+      - name: Update tapgres-bin PKGBUILD
+        run: |
+          sed -i "s/^pkgver=.*/pkgver=${{ steps.sha256.outputs.version }}/" packaging/tapgres-bin/PKGBUILD
+          sed -i "s/^sha256sums=.*/sha256sums=('${{ steps.sha256.outputs.binary }}')/" packaging/tapgres-bin/PKGBUILD
+
+      - name: Deploy tapgres-bin to AUR
         uses: KSXGitHub/github-actions-deploy-aur@v4.1.1
         with:
           pkgname: tapgres-bin
-          pkgbuild: ./PKGBUILD
+          pkgbuild: ./packaging/tapgres-bin/PKGBUILD
+          commit_username: sunng
+          commit_email: n@sunng.info
+          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+
+      - name: Update tapgres PKGBUILD
+        run: |
+          sed -i "s/^pkgver=.*/pkgver=${{ steps.sha256.outputs.version }}/" packaging/tapgres/PKGBUILD
+          sed -i "s/^sha256sums=.*/sha256sums=('${{ steps.sha256.outputs.source }}')/" packaging/tapgres/PKGBUILD
+
+      - name: Deploy tapgres to AUR
+        uses: KSXGitHub/github-actions-deploy-aur@v4.1.1
+        with:
+          pkgname: tapgres
+          pkgbuild: ./packaging/tapgres/PKGBUILD
           commit_username: sunng
           commit_email: n@sunng.info
           ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
