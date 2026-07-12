@@ -247,9 +247,9 @@ fn draw(frame: &mut Frame, app: &App, log_h: usize) {
         metrics.conns_live,
         metrics.conns_opened,
         human(current.bytes_in),
-        human_packets(current.pkts_in),
+        human_messages(current.msgs_in),
         human(current.bytes_out),
-        human_packets(current.pkts_out),
+        human_messages(current.msgs_out),
         human(average),
         human(peak),
     );
@@ -314,11 +314,11 @@ fn human(value: u64) -> String {
     }
 }
 
-fn human_packets(value: u64) -> String {
+fn human_messages(value: u64) -> String {
     if value < 1_000 {
-        format!("{value}p")
+        format!("{value}msg")
     } else {
-        format!("{:.1}kp", value as f64 / 1_000.0)
+        format!("{:.1}kmsg", value as f64 / 1_000.0)
     }
 }
 

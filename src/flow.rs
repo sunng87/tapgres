@@ -156,15 +156,6 @@ impl Connection {
     }
 
     fn handle(&mut self, seg: &TcpSegment, pg_port: u16, metrics: &Metrics) {
-        metrics.record(
-            &self.stats,
-            if seg.dst_port == pg_port {
-                TrafficDirection::In
-            } else {
-                TrafficDirection::Out
-            },
-            seg.payload.len(),
-        );
         if self.encrypted {
             return;
         }
@@ -196,6 +187,21 @@ impl Connection {
         if outcome.encrypted {
             self.encrypted = true;
             metrics.set_encrypted(&self.stats, true);
+        }
+        // Count decoded pgwire messages, not TCP segments: one segment may
+        // complete zero, one, or many buffered messages (or none, once the
+        // stream has gone encrypted and we stopped draining).
+        if outcome.msgs > 0 {
+            metrics.record_messages(
+                &self.stats,
+                if is_client_dir {
+                    TrafficDirection::In
+                } else {
+                    TrafficDirection::Out
+                },
+                outcome.msgs,
+                outcome.bytes,
+            );
         }
     }
 }
@@ -339,8 +345,9 @@ mod tests {
         let snapshot = metrics.snapshot();
         assert_eq!(snapshot.conns_opened, 1);
         assert_eq!(snapshot.conns_live, 0);
-        assert_eq!(snapshot.pkts_in, 4);
-        assert_eq!(snapshot.pkts_out, 3);
+        // A bare TCP close handshake carries no pgwire messages.
+        assert_eq!(snapshot.msgs_in, 0);
+        assert_eq!(snapshot.msgs_out, 0);
         assert_eq!(snapshot.connections.len(), 1);
         assert_eq!(table.map.len(), 1);
         assert!(matches!(
@@ -361,7 +368,8 @@ mod tests {
         assert_eq!(snapshot.conns_opened, 1);
         assert_eq!(snapshot.conns_live, 0);
         assert_eq!(snapshot.connections.len(), 1);
-        assert_eq!(snapshot.connections[0].bytes_in, 3);
+        // Partial bytes that never form a complete message are not counted.
+        assert_eq!(snapshot.connections[0].bytes_in, 0);
     }
 
     #[test]

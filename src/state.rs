@@ -1,8 +1,8 @@
 //! Shared, source-agnostic connection and traffic metrics.
 //!
-//! Aggregate and per-connection counters use atomics so packet/read accounting
-//! does not lock. The registry is touched only when connections open, close,
-//! or a consumer requests a snapshot.
+//! Aggregate and per-connection counters use atomics so message/byte
+//! accounting does not lock. The registry is touched only when connections
+//! open, close, or a consumer requests a snapshot.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
@@ -36,8 +36,8 @@ pub struct ConnStats {
     server: SocketAddr,
     lifecycle: Mutex<ConnectionLifecycle>,
     encrypted: AtomicBool,
-    pkts_in: AtomicU64,
-    pkts_out: AtomicU64,
+    msgs_in: AtomicU64,
+    msgs_out: AtomicU64,
     bytes_in: AtomicU64,
     bytes_out: AtomicU64,
 }
@@ -49,16 +49,16 @@ pub struct ConnSnapshot {
     pub server: SocketAddr,
     pub lifecycle: ConnectionLifecycle,
     pub encrypted: bool,
-    pub pkts_in: u64,
-    pub pkts_out: u64,
+    pub msgs_in: u64,
+    pub msgs_out: u64,
     pub bytes_in: u64,
     pub bytes_out: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RateSample {
-    pub pkts_in: u64,
-    pub pkts_out: u64,
+    pub msgs_in: u64,
+    pub msgs_out: u64,
     pub bytes_in: u64,
     pub bytes_out: u64,
 }
@@ -67,8 +67,8 @@ pub struct RateSample {
 pub struct MetricsSnapshot {
     pub conns_opened: u64,
     pub conns_live: usize,
-    pub pkts_in: u64,
-    pub pkts_out: u64,
+    pub msgs_in: u64,
+    pub msgs_out: u64,
     pub bytes_in: u64,
     pub bytes_out: u64,
     pub connections: Vec<ConnSnapshot>,
@@ -79,8 +79,8 @@ pub struct MetricsSnapshot {
 pub struct MetricsSummary {
     pub conns_opened: u64,
     pub conns_live: usize,
-    pub pkts_in: u64,
-    pub pkts_out: u64,
+    pub msgs_in: u64,
+    pub msgs_out: u64,
     pub bytes_in: u64,
     pub bytes_out: u64,
     pub rates: Vec<RateSample>,
@@ -93,8 +93,8 @@ struct Registry {
 
 #[derive(Default)]
 struct Totals {
-    pkts_in: u64,
-    pkts_out: u64,
+    msgs_in: u64,
+    msgs_out: u64,
     bytes_in: u64,
     bytes_out: u64,
 }
@@ -108,8 +108,8 @@ pub struct Metrics {
     conns_opened: AtomicU64,
     conns_live: AtomicUsize,
     next_conn_id: AtomicU64,
-    pkts_in: AtomicU64,
-    pkts_out: AtomicU64,
+    msgs_in: AtomicU64,
+    msgs_out: AtomicU64,
     bytes_in: AtomicU64,
     bytes_out: AtomicU64,
     conns: Mutex<Registry>,
@@ -149,8 +149,8 @@ impl Metrics {
             conns_opened: AtomicU64::new(0),
             conns_live: AtomicUsize::new(0),
             next_conn_id: AtomicU64::new(1),
-            pkts_in: AtomicU64::new(0),
-            pkts_out: AtomicU64::new(0),
+            msgs_in: AtomicU64::new(0),
+            msgs_out: AtomicU64::new(0),
             bytes_in: AtomicU64::new(0),
             bytes_out: AtomicU64::new(0),
             conns: Mutex::new(Registry {
@@ -180,8 +180,8 @@ impl Metrics {
             server,
             lifecycle: Mutex::new(ConnectionLifecycle::Open { since }),
             encrypted: AtomicBool::new(encrypted),
-            pkts_in: AtomicU64::new(0),
-            pkts_out: AtomicU64::new(0),
+            msgs_in: AtomicU64::new(0),
+            msgs_out: AtomicU64::new(0),
             bytes_in: AtomicU64::new(0),
             bytes_out: AtomicU64::new(0),
         });
@@ -192,19 +192,28 @@ impl Metrics {
         stats
     }
 
-    pub fn record(&self, conn: &ConnStats, direction: TrafficDirection, bytes: usize) {
-        let bytes = bytes as u64;
+    /// Account for `count` decoded pgwire messages (`bytes` of wire data)
+    /// flowing in `direction` on `conn`. Updates both the aggregate totals and
+    /// the per-connection counters atomically. Called once per drain batch
+    /// (a batch may span several TCP segments / socket reads).
+    pub fn record_messages(
+        &self,
+        conn: &ConnStats,
+        direction: TrafficDirection,
+        count: u64,
+        bytes: u64,
+    ) {
         match direction {
             TrafficDirection::In => {
-                self.pkts_in.fetch_add(1, Ordering::Relaxed);
+                self.msgs_in.fetch_add(count, Ordering::Relaxed);
                 self.bytes_in.fetch_add(bytes, Ordering::Relaxed);
-                conn.pkts_in.fetch_add(1, Ordering::Relaxed);
+                conn.msgs_in.fetch_add(count, Ordering::Relaxed);
                 conn.bytes_in.fetch_add(bytes, Ordering::Relaxed);
             }
             TrafficDirection::Out => {
-                self.pkts_out.fetch_add(1, Ordering::Relaxed);
+                self.msgs_out.fetch_add(count, Ordering::Relaxed);
                 self.bytes_out.fetch_add(bytes, Ordering::Relaxed);
-                conn.pkts_out.fetch_add(1, Ordering::Relaxed);
+                conn.msgs_out.fetch_add(count, Ordering::Relaxed);
                 conn.bytes_out.fetch_add(bytes, Ordering::Relaxed);
             }
         }
@@ -243,8 +252,8 @@ impl Metrics {
         let totals = self.totals();
         let mut history = self.rates.lock().unwrap();
         let sample = RateSample {
-            pkts_in: totals.pkts_in.saturating_sub(history.previous.pkts_in),
-            pkts_out: totals.pkts_out.saturating_sub(history.previous.pkts_out),
+            msgs_in: totals.msgs_in.saturating_sub(history.previous.msgs_in),
+            msgs_out: totals.msgs_out.saturating_sub(history.previous.msgs_out),
             bytes_in: totals.bytes_in.saturating_sub(history.previous.bytes_in),
             bytes_out: totals.bytes_out.saturating_sub(history.previous.bytes_out),
         };
@@ -297,8 +306,8 @@ impl Metrics {
         MetricsSummary {
             conns_opened: self.conns_opened.load(Ordering::Relaxed),
             conns_live: self.conns_live.load(Ordering::Relaxed),
-            pkts_in: totals.pkts_in,
-            pkts_out: totals.pkts_out,
+            msgs_in: totals.msgs_in,
+            msgs_out: totals.msgs_out,
             bytes_in: totals.bytes_in,
             bytes_out: totals.bytes_out,
             rates,
@@ -317,8 +326,8 @@ impl Metrics {
                 server: conn.server,
                 lifecycle,
                 encrypted: conn.encrypted.load(Ordering::Relaxed),
-                pkts_in: conn.pkts_in.load(Ordering::Relaxed),
-                pkts_out: conn.pkts_out.load(Ordering::Relaxed),
+                msgs_in: conn.msgs_in.load(Ordering::Relaxed),
+                msgs_out: conn.msgs_out.load(Ordering::Relaxed),
                 bytes_in: conn.bytes_in.load(Ordering::Relaxed),
                 bytes_out: conn.bytes_out.load(Ordering::Relaxed),
             });
@@ -328,8 +337,8 @@ impl Metrics {
         MetricsSnapshot {
             conns_opened: summary.conns_opened,
             conns_live: summary.conns_live,
-            pkts_in: summary.pkts_in,
-            pkts_out: summary.pkts_out,
+            msgs_in: summary.msgs_in,
+            msgs_out: summary.msgs_out,
             bytes_in: summary.bytes_in,
             bytes_out: summary.bytes_out,
             connections,
@@ -339,8 +348,8 @@ impl Metrics {
 
     fn totals(&self) -> Totals {
         Totals {
-            pkts_in: self.pkts_in.load(Ordering::Relaxed),
-            pkts_out: self.pkts_out.load(Ordering::Relaxed),
+            msgs_in: self.msgs_in.load(Ordering::Relaxed),
+            msgs_out: self.msgs_out.load(Ordering::Relaxed),
             bytes_in: self.bytes_in.load(Ordering::Relaxed),
             bytes_out: self.bytes_out.load(Ordering::Relaxed),
         }
@@ -361,7 +370,7 @@ mod tests {
         let metrics = Metrics::with_limits(2, 60);
         for port in 1..=3 {
             let conn = metrics.open_connection(endpoint(port), endpoint(5432), false);
-            metrics.record(&conn, TrafficDirection::In, port as usize);
+            metrics.record_messages(&conn, TrafficDirection::In, 1, port as u64);
             metrics.close_connection(&conn);
         }
         let snapshot = metrics.snapshot();
@@ -392,22 +401,22 @@ mod tests {
     fn rate_samples_are_aggregate_deltas() {
         let metrics = Metrics::with_limits(10, 2);
         let conn = metrics.open_connection(endpoint(1), endpoint(5432), false);
-        metrics.record(&conn, TrafficDirection::In, 12);
-        metrics.record(&conn, TrafficDirection::Out, 20);
+        metrics.record_messages(&conn, TrafficDirection::In, 1, 12);
+        metrics.record_messages(&conn, TrafficDirection::Out, 1, 20);
         let first = metrics.sample_rates();
-        assert_eq!((first.pkts_in, first.bytes_in), (1, 12));
-        assert_eq!((first.pkts_out, first.bytes_out), (1, 20));
-        metrics.record(&conn, TrafficDirection::In, 5);
+        assert_eq!((first.msgs_in, first.bytes_in), (1, 12));
+        assert_eq!((first.msgs_out, first.bytes_out), (1, 20));
+        metrics.record_messages(&conn, TrafficDirection::In, 1, 5);
         let second = metrics.sample_rates();
-        assert_eq!((second.pkts_in, second.bytes_in), (1, 5));
-        assert_eq!((second.pkts_out, second.bytes_out), (0, 0));
+        assert_eq!((second.msgs_in, second.bytes_in), (1, 5));
+        assert_eq!((second.msgs_out, second.bytes_out), (0, 0));
     }
 
     #[test]
     fn managed_sampler_ticks_and_stops() {
         let metrics = Arc::new(Metrics::with_limits(10, 2));
         let conn = metrics.open_connection(endpoint(1), endpoint(5432), false);
-        metrics.record(&conn, TrafficDirection::In, 12);
+        metrics.record_messages(&conn, TrafficDirection::In, 1, 12);
         let sampler = metrics
             .spawn_rate_sampler_every(Duration::from_millis(5))
             .unwrap();
