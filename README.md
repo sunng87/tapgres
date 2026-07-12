@@ -107,10 +107,10 @@ Keybindings:
 | `c` | clear |
 
 The direction symbol is highlighted in a high-contrast colour (`[F→B]` cyan,
-`[B→F]` magenta) and the message name is bold; warnings are red and connection
+`[B→F]` magenta) and the packet name is bold; warnings are red and connection
 notices yellow. The metrics header shows active and total connections,
-cumulative in/out bytes and message counts with current byte rates, and
-60-second messages-per-second sparklines (in cyan, out magenta).
+cumulative in/out bytes and packet counts with current byte rates, and
+60-second packets-per-second sparklines (in cyan, out magenta).
 Closed connection records and their final counters are retained for future
 filtering (10,000 by default). Tune these bounds with `--conn-history` and
 `--rate-history`. Message and byte counts are pgwire messages decoded from the
