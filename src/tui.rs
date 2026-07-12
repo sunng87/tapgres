@@ -108,6 +108,11 @@ struct App {
     wrap: bool,
     mode: &'static str,
     metrics: Arc<Metrics>,
+    /// All-time peak messages/sec seen this session, per direction. Used as a
+    /// fixed sparkline scale so bars don't rescale as the rate window slides;
+    /// the value only ever grows.
+    peak_msgs_in: u64,
+    peak_msgs_out: u64,
 }
 
 impl App {
@@ -120,6 +125,8 @@ impl App {
             wrap: false,
             mode,
             metrics,
+            peak_msgs_in: 0,
+            peak_msgs_out: 0,
         }
     }
 }
@@ -137,9 +144,9 @@ fn app_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Result
             app.events.drain(..drop_n);
         }
 
-        // 6 (metrics) + 3 (footer) + 2 (log block borders) rows of chrome.
+        // 5 (metrics) + 3 (footer) + 2 (log block borders) rows of chrome.
         let term_h = terminal.size()?.height as usize;
-        let log_h = term_h.saturating_sub(11).max(1);
+        let log_h = term_h.saturating_sub(10).max(1);
 
         // In wrap mode an event may span several rows, so the viewport holds
         // fewer than `log_h` events; allow scrolling up to the last event.
@@ -153,6 +160,19 @@ fn app_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Result
             app.scroll = max_scroll;
         }
         app.scroll = app.scroll.min(max_scroll);
+
+        // Fixed sparkline scale: track the all-time peak messages/sec per
+        // direction so the bars keep a stable scale instead of rescaling to
+        // the current window's max as samples expire or arrive.
+        {
+            let summary = app.metrics.summary();
+            app.peak_msgs_in = app
+                .peak_msgs_in
+                .max(summary.rates.iter().map(|r| r.msgs_in).max().unwrap_or(0));
+            app.peak_msgs_out = app
+                .peak_msgs_out
+                .max(summary.rates.iter().map(|r| r.msgs_out).max().unwrap_or(0));
+        }
 
         terminal.draw(|frame| draw(frame, &app, log_h))?;
 
@@ -213,7 +233,7 @@ fn handle_key(app: &mut App, log_h: usize, key: KeyEvent) -> bool {
 
 fn draw(frame: &mut Frame, app: &App, log_h: usize) {
     let [title_area, log_area, foot_area] = Layout::vertical([
-        Constraint::Length(6),
+        Constraint::Length(5),
         Constraint::Fill(1),
         Constraint::Length(3),
     ])
@@ -281,20 +301,12 @@ fn draw(frame: &mut Frame, app: &App, log_h: usize) {
     );
 
     // Right column: two stacked sparklines (in cyan, out magenta) + caption.
-    let [chart_label, chart_in, chart_out, chart_cap] = Layout::vertical([
-        Constraint::Length(1),
+    let [chart_in, chart_out, chart_cap] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
     ])
     .areas(chart_area);
-    frame.render_widget(
-        Paragraph::new(Text::styled(
-            "MESSAGES/SEC",
-            Style::default().fg(Color::DarkGray),
-        )),
-        chart_label,
-    );
     let [in_tag, in_spark] =
         Layout::horizontal([Constraint::Length(5), Constraint::Fill(1)]).areas(chart_in);
     frame.render_widget(
@@ -310,6 +322,7 @@ fn draw(frame: &mut Frame, app: &App, log_h: usize) {
         Sparkline::default()
             .direction(RenderDirection::RightToLeft)
             .data(msgs_in.iter().rev())
+            .max(app.peak_msgs_in.max(1))
             .style(Style::default().fg(Color::Cyan)),
         in_spark,
     );
@@ -326,6 +339,7 @@ fn draw(frame: &mut Frame, app: &App, log_h: usize) {
         Sparkline::default()
             .direction(RenderDirection::RightToLeft)
             .data(msgs_out.iter().rev())
+            .max(app.peak_msgs_out.max(1))
             .style(Style::default().fg(Color::Magenta)),
         out_spark,
     );
@@ -408,8 +422,9 @@ fn with_commas(n: u64) -> String {
     out
 }
 
-/// A four-line stat column for the metrics header: label / big value / sub
-/// value / rate. Content is owned so the returned `Text` is `'static`.
+/// A three-line stat column for the metrics header: the label sits inline
+/// with the big value, followed by the sub value and the rate. Content is
+/// owned so the returned `Text` is `'static`.
 fn stat_text(
     label: &str,
     big: String,
@@ -418,10 +433,12 @@ fn stat_text(
     rate: String,
 ) -> Text<'static> {
     Text::from(vec![
-        Line::styled(label.to_string(), Style::default().fg(Color::DarkGray)),
-        Line::styled(format!(" {big}"), Style::default().fg(big_color).bold()),
-        Line::styled(format!(" {sub}"), Style::default().fg(Color::Gray).bold()),
-        Line::styled(format!(" {rate}"), Style::default().fg(Color::Gray).bold()),
+        Line::from(vec![
+            Span::styled(format!("{label} "), Style::default().fg(Color::DarkGray)),
+            Span::styled(big, Style::default().fg(big_color).bold()),
+        ]),
+        Line::styled(sub, Style::default().fg(Color::Gray).bold()),
+        Line::styled(rate, Style::default().fg(Color::Gray).bold()),
     ])
 }
 
