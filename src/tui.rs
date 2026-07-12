@@ -245,14 +245,9 @@ fn draw(frame: &mut Frame, app: &App, log_h: usize) {
     let header_inner = header_block.inner(title_area);
     frame.render_widget(header_block, title_area);
 
-    // Active | total in | total out | packets-per-second, in four columns.
-    let [active_area, in_area, out_area, chart_area] = Layout::horizontal([
-        Constraint::Length(14),
-        Constraint::Length(18),
-        Constraint::Length(18),
-        Constraint::Fill(1),
-    ])
-    .areas(header_inner);
+    // Active | total in | total out | packets-per-second — four equal columns.
+    let [active_area, in_area, out_area, chart_area] =
+        Layout::horizontal([Constraint::Fill(1); 4]).areas(header_inner);
 
     frame.render_widget(
         stat_text(
@@ -505,10 +500,10 @@ fn build_line(line: &str) -> Line<'_> {
         .map(|p| kind_start + p)
         .unwrap_or(line.len());
     Line::from(vec![
-        Span::raw(&line[..start]),
+        Span::raw(&line[..start]).fg(Color::DarkGray),
         Span::raw(&line[start..end]).fg(color).bold(),
         Span::raw(&line[end..kind_start]),
-        Span::raw(&line[kind_start..kind_end]).bold(),
+        Span::raw(&line[kind_start..kind_end]).fg(color).bold(),
         Span::raw(&line[kind_end..]),
     ])
 }
