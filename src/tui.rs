@@ -23,7 +23,7 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, Ke
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Paragraph, Sparkline, Wrap};
+use ratatui::widgets::{Block, Paragraph, RenderDirection, Sparkline, Wrap};
 
 use crate::capture::PcapOpts;
 use crate::decode::{self, Output};
@@ -137,9 +137,9 @@ fn app_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Result
             app.events.drain(..drop_n);
         }
 
-        // 4 (metrics) + 3 (footer) + 2 (log block borders) rows of chrome.
+        // 6 (metrics) + 3 (footer) + 2 (log block borders) rows of chrome.
         let term_h = terminal.size()?.height as usize;
-        let log_h = term_h.saturating_sub(9).max(1);
+        let log_h = term_h.saturating_sub(11).max(1);
 
         // In wrap mode an event may span several rows, so the viewport holds
         // fewer than `log_h` events; allow scrolling up to the last event.
@@ -213,56 +213,138 @@ fn handle_key(app: &mut App, log_h: usize, key: KeyEvent) -> bool {
 
 fn draw(frame: &mut Frame, app: &App, log_h: usize) {
     let [title_area, log_area, foot_area] = Layout::vertical([
-        Constraint::Length(4),
+        Constraint::Length(6),
         Constraint::Fill(1),
         Constraint::Length(3),
     ])
     .areas(frame.area());
 
-    // --- title bar ---
-    let follow_tag = if app.follow { " · following" } else { "" };
-    let wrap_tag = if app.wrap { " · wrap" } else { "" };
+    // --- title bar: rich metrics header ---
     let heading = format!(
-        " tapgres — {} mode · {} events{}{} ",
+        " tapgres — {} mode · {} events ",
         app.mode,
-        app.events.len(),
-        follow_tag,
-        wrap_tag,
+        app.events.len()
     );
     let metrics = app.metrics.summary();
     let current = metrics.rates.last().copied().unwrap_or_default();
-    let totals: Vec<u64> = metrics
+
+    // Packets-per-second series over the rate window. In is cyan and out is
+    // magenta to match the [F→B]/[B→F] colour scheme used in the packet view.
+    let pkts_in: Vec<u64> = metrics.rates.iter().map(|r| r.pkts_in).collect();
+    let pkts_out: Vec<u64> = metrics.rates.iter().map(|r| r.pkts_out).collect();
+    let combined: Vec<u64> = metrics
         .rates
         .iter()
-        .map(|rate| rate.bytes_in.saturating_add(rate.bytes_out))
+        .map(|r| r.pkts_in.saturating_add(r.pkts_out))
         .collect();
-    let average = if totals.is_empty() {
-        0
-    } else {
-        totals.iter().copied().fold(0u64, u64::saturating_add) / totals.len() as u64
-    };
-    let peak = totals.iter().copied().max().unwrap_or(0);
-    let summary = format!(
-        " live {} / opened {} · in {}/s {}/s · out {}/s {}/s · total avg {}/s peak {}/s ",
-        metrics.conns_live,
-        metrics.conns_opened,
-        human(current.bytes_in),
-        human_packets(current.pkts_in),
-        human(current.bytes_out),
-        human_packets(current.pkts_out),
-        human(average),
-        human(peak),
+    let avg = combined.iter().copied().sum::<u64>() / combined.len().max(1) as u64;
+    let peak = combined.iter().copied().max().unwrap_or(0);
+    let now = current.pkts_in.saturating_add(current.pkts_out);
+
+    let header_block = Block::bordered().title_top(Line::raw(heading));
+    let header_inner = header_block.inner(title_area);
+    frame.render_widget(header_block, title_area);
+
+    // Active | total in | total out | packets-per-second, in four columns.
+    let [active_area, in_area, out_area, chart_area] = Layout::horizontal([
+        Constraint::Length(14),
+        Constraint::Length(18),
+        Constraint::Length(18),
+        Constraint::Fill(1),
+    ])
+    .areas(header_inner);
+
+    frame.render_widget(
+        stat_text(
+            "ACTIVE",
+            metrics.conns_live.to_string(),
+            Color::Reset,
+            format!("opened {}", metrics.conns_opened),
+            String::new(),
+        ),
+        active_area,
     );
-    let metrics_block = Block::bordered()
-        .title_top(Line::raw(heading))
-        .title_bottom(Line::raw(summary));
-    let metrics_inner = metrics_block.inner(title_area);
-    frame.render_widget(metrics_block, title_area);
+    frame.render_widget(
+        stat_text(
+            "TOTAL IN",
+            human(metrics.bytes_in),
+            Color::Cyan,
+            format!("{} pkts", with_commas(metrics.pkts_in)),
+            format!("{}/s", human(current.bytes_in)),
+        ),
+        in_area,
+    );
+    frame.render_widget(
+        stat_text(
+            "TOTAL OUT",
+            human(metrics.bytes_out),
+            Color::Magenta,
+            format!("{} pkts", with_commas(metrics.pkts_out)),
+            format!("{}/s", human(current.bytes_out)),
+        ),
+        out_area,
+    );
+
+    // Right column: two stacked sparklines (in cyan, out magenta) + caption.
+    let [chart_label, chart_in, chart_out, chart_cap] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(chart_area);
+    frame.render_widget(
+        Paragraph::new(Text::styled(
+            "PACKETS/SEC",
+            Style::default().fg(Color::DarkGray),
+        )),
+        chart_label,
+    );
+    let [in_tag, in_spark] =
+        Layout::horizontal([Constraint::Length(5), Constraint::Fill(1)]).areas(chart_in);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("in ", Style::default().fg(Color::Cyan)),
+            Span::styled("→", Style::default().fg(Color::Cyan).bold()),
+        ])),
+        in_tag,
+    );
+    // Right-to-left with the series reversed: the newest sample pins to the
+    // right edge and older samples scroll left, like a live-activity chart.
     frame.render_widget(
         Sparkline::default()
-            .data(&totals)
+            .direction(RenderDirection::RightToLeft)
+            .data(pkts_in.iter().rev())
             .style(Style::default().fg(Color::Cyan)),
-        metrics_inner,
+        in_spark,
+    );
+    let [out_tag, out_spark] =
+        Layout::horizontal([Constraint::Length(5), Constraint::Fill(1)]).areas(chart_out);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("out ", Style::default().fg(Color::Magenta)),
+            Span::styled("←", Style::default().fg(Color::Magenta).bold()),
+        ])),
+        out_tag,
+    );
+    frame.render_widget(
+        Sparkline::default()
+            .direction(RenderDirection::RightToLeft)
+            .data(pkts_out.iter().rev())
+            .style(Style::default().fg(Color::Magenta)),
+        out_spark,
+    );
+    frame.render_widget(
+        Paragraph::new(Text::styled(
+            format!(
+                "now {} avg {} peak {}",
+                with_commas(now),
+                with_commas(avg),
+                with_commas(peak)
+            ),
+            Style::default().fg(Color::Gray),
+        )),
+        chart_cap,
     );
 
     // --- packet view ---
@@ -289,14 +371,17 @@ fn draw(frame: &mut Frame, app: &App, log_h: usize) {
     }
     frame.render_widget(para, log_area);
 
-    // --- footer ---
-    frame.render_widget(
-        Paragraph::new(Text::raw(
-            " q quit · j/k ↑↓ · PgUp/PgDn · g/G top/bottom · f follow · w wrap · c clear ",
-        ))
-        .block(Block::bordered()),
-        foot_area,
-    );
+    // --- footer: follow/wrap state shown by colour (green = on) ---
+    let on = Style::default().fg(Color::Green);
+    let off = Style::default();
+    let footer = Line::from(vec![
+        Span::raw(" q quit · j/k ↑↓ · PgUp/PgDn · g/G top/bottom · f "),
+        Span::styled("follow", if app.follow { on } else { off }),
+        Span::raw(" · w "),
+        Span::styled("wrap", if app.wrap { on } else { off }),
+        Span::raw(" · c clear "),
+    ]);
+    frame.render_widget(Paragraph::new(footer).block(Block::bordered()), foot_area);
 }
 
 fn human(value: u64) -> String {
@@ -314,12 +399,35 @@ fn human(value: u64) -> String {
     }
 }
 
-fn human_packets(value: u64) -> String {
-    if value < 1_000 {
-        format!("{value}p")
-    } else {
-        format!("{:.1}kp", value as f64 / 1_000.0)
+/// Group a number with thousands separators: `8521` -> `8,521`.
+fn with_commas(n: u64) -> String {
+    let s = n.to_string();
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, b) in bytes.iter().enumerate() {
+        if i != 0 && (bytes.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(*b as char);
     }
+    out
+}
+
+/// A four-line stat column for the metrics header: label / big value / sub
+/// value / rate. Content is owned so the returned `Text` is `'static`.
+fn stat_text(
+    label: &str,
+    big: String,
+    big_color: Color,
+    sub: String,
+    rate: String,
+) -> Text<'static> {
+    Text::from(vec![
+        Line::styled(label.to_string(), Style::default().fg(Color::DarkGray)),
+        Line::styled(format!(" {big}"), Style::default().fg(big_color).bold()),
+        Line::styled(format!(" {sub}"), Style::default().fg(Color::Gray).bold()),
+        Line::styled(format!(" {rate}"), Style::default().fg(Color::Gray).bold()),
+    ])
 }
 
 /// In wrap mode, pick the slice `[start, end)` of events to render so the
