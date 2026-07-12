@@ -15,6 +15,7 @@
 use crossbeam_channel::Receiver;
 use std::error::Error;
 use std::io;
+use std::sync::Arc;
 use std::time::Duration;
 
 use ratatui::Frame;
@@ -22,29 +23,33 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, Ke
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Paragraph, Wrap};
+use ratatui::widgets::{Block, Paragraph, Sparkline, Wrap};
 
 use crate::capture::PcapOpts;
 use crate::decode::{self, Output};
 use crate::proxy::ProxyOpts;
+use crate::state::Metrics;
 
 /// Cap on retained lines in the TUI's own buffer.
 const HISTORY_CAP: usize = 50_000;
 
 /// TUI over the passive pcap capture.
-pub fn run_pcap(opts: PcapOpts) -> Result<(), Box<dyn Error>> {
+pub fn run_pcap(opts: PcapOpts, metrics: Arc<Metrics>) -> Result<(), Box<dyn Error>> {
+    let source_metrics = metrics.clone();
     run(
         Box::new(move || {
-            if let Err(e) = crate::capture::run(opts) {
+            if let Err(e) = crate::capture::run(opts, source_metrics) {
                 decode::status(format!("⚠ pcap source error: {e}"));
             }
         }),
         "pcap",
+        metrics,
     )
 }
 
 /// TUI over the TLS-terminating mitm proxy.
-pub fn run_mitm(opts: ProxyOpts) -> Result<(), Box<dyn Error>> {
+pub fn run_mitm(opts: ProxyOpts, metrics: Arc<Metrics>) -> Result<(), Box<dyn Error>> {
+    let source_metrics = metrics.clone();
     run(
         Box::new(move || {
             let rt = match tokio::runtime::Builder::new_multi_thread()
@@ -57,11 +62,12 @@ pub fn run_mitm(opts: ProxyOpts) -> Result<(), Box<dyn Error>> {
                     return;
                 }
             };
-            if let Err(e) = rt.block_on(crate::proxy::serve(opts)) {
+            if let Err(e) = rt.block_on(crate::proxy::serve(opts, source_metrics)) {
                 decode::status(format!("⚠ mitm source error: {e}"));
             }
         }),
         "mitm",
+        metrics,
     )
 }
 
@@ -70,6 +76,7 @@ pub fn run_mitm(opts: ProxyOpts) -> Result<(), Box<dyn Error>> {
 fn run(
     source: Box<dyn FnOnce() + Send + 'static>,
     mode: &'static str,
+    metrics: Arc<Metrics>,
 ) -> Result<(), Box<dyn Error>> {
     // One channel: the source (background thread) produces via decode::out,
     // the TUI (this thread) consumes.
@@ -80,9 +87,10 @@ fn run(
     let _source_thread = std::thread::Builder::new()
         .name("tapgres-source".into())
         .spawn(source)?;
+    let _rate_sampler = metrics.spawn_rate_sampler()?;
 
     let mut terminal = ratatui::try_init()?;
-    let result = app_loop(&mut terminal, App::new(rx, mode));
+    let result = app_loop(&mut terminal, App::new(rx, mode, metrics));
     // Restore the terminal even on error. try_init installs a panic hook that
     // also restores, so panics are covered too.
     let _ = ratatui::try_restore();
@@ -99,10 +107,11 @@ struct App {
     /// Wrap long lines to the viewport width.
     wrap: bool,
     mode: &'static str,
+    metrics: Arc<Metrics>,
 }
 
 impl App {
-    fn new(rx: Receiver<Output>, mode: &'static str) -> Self {
+    fn new(rx: Receiver<Output>, mode: &'static str, metrics: Arc<Metrics>) -> Self {
         Self {
             rx,
             events: Vec::new(),
@@ -110,6 +119,7 @@ impl App {
             follow: true,
             wrap: false,
             mode,
+            metrics,
         }
     }
 }
@@ -127,9 +137,9 @@ fn app_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Result
             app.events.drain(..drop_n);
         }
 
-        // 3 (title) + 3 (footer) + 2 (log block borders) rows of chrome.
+        // 4 (metrics) + 3 (footer) + 2 (log block borders) rows of chrome.
         let term_h = terminal.size()?.height as usize;
-        let log_h = term_h.saturating_sub(8).max(1);
+        let log_h = term_h.saturating_sub(9).max(1);
 
         // In wrap mode an event may span several rows, so the viewport holds
         // fewer than `log_h` events; allow scrolling up to the last event.
@@ -203,7 +213,7 @@ fn handle_key(app: &mut App, log_h: usize, key: KeyEvent) -> bool {
 
 fn draw(frame: &mut Frame, app: &App, log_h: usize) {
     let [title_area, log_area, foot_area] = Layout::vertical([
-        Constraint::Length(3),
+        Constraint::Length(4),
         Constraint::Fill(1),
         Constraint::Length(3),
     ])
@@ -212,14 +222,48 @@ fn draw(frame: &mut Frame, app: &App, log_h: usize) {
     // --- title bar ---
     let follow_tag = if app.follow { " · following" } else { "" };
     let wrap_tag = if app.wrap { " · wrap" } else { "" };
-    let title = format!(
+    let heading = format!(
         " tapgres — {} mode · {} events{}{} ",
         app.mode,
         app.events.len(),
         follow_tag,
         wrap_tag,
     );
-    frame.render_widget(Block::bordered().title_top(Line::raw(title)), title_area);
+    let metrics = app.metrics.summary();
+    let current = metrics.rates.last().copied().unwrap_or_default();
+    let totals: Vec<u64> = metrics
+        .rates
+        .iter()
+        .map(|rate| rate.bytes_in.saturating_add(rate.bytes_out))
+        .collect();
+    let average = if totals.is_empty() {
+        0
+    } else {
+        totals.iter().copied().fold(0u64, u64::saturating_add) / totals.len() as u64
+    };
+    let peak = totals.iter().copied().max().unwrap_or(0);
+    let summary = format!(
+        " live {} / opened {} · in {}/s {}/s · out {}/s {}/s · total avg {}/s peak {}/s ",
+        metrics.conns_live,
+        metrics.conns_opened,
+        human(current.bytes_in),
+        human_packets(current.pkts_in),
+        human(current.bytes_out),
+        human_packets(current.pkts_out),
+        human(average),
+        human(peak),
+    );
+    let metrics_block = Block::bordered()
+        .title_top(Line::raw(heading))
+        .title_bottom(Line::raw(summary));
+    let metrics_inner = metrics_block.inner(title_area);
+    frame.render_widget(metrics_block, title_area);
+    frame.render_widget(
+        Sparkline::default()
+            .data(&totals)
+            .style(Style::default().fg(Color::Cyan)),
+        metrics_inner,
+    );
 
     // --- packet view ---
     let log_block = Block::bordered()
@@ -253,6 +297,29 @@ fn draw(frame: &mut Frame, app: &App, log_h: usize) {
         .block(Block::bordered()),
         foot_area,
     );
+}
+
+fn human(value: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+    let mut value = value as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{}{}", value as u64, UNITS[unit])
+    } else {
+        format!("{value:.1}{}", UNITS[unit])
+    }
+}
+
+fn human_packets(value: u64) -> String {
+    if value < 1_000 {
+        format!("{value}p")
+    } else {
+        format!("{:.1}kp", value as f64 / 1_000.0)
+    }
 }
 
 /// In wrap mode, pick the slice `[start, end)` of events to render so the

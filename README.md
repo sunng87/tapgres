@@ -84,7 +84,7 @@ the upstream certificate — it assumes a local, operator-controlled server.
 
 ## Interactive TUI (`--tui`)
 
-![tapgres TUI: decoded PostgreSQL traffic](screenshots/tui.png)
+![tapgres TUI: live connection metrics, rate sparkline, and decoded PostgreSQL traffic](screenshots/tui-metrics.png)
 
 Add `--tui` to either mode for a full-screen, scrollable view instead of
 line-oriented stdout. The chosen source runs in a background thread and feeds
@@ -108,8 +108,14 @@ Keybindings:
 
 The direction symbol is highlighted in a high-contrast colour (`[F→B]` cyan,
 `[B→F]` magenta) and the packet name is bold; warnings are red and connection
-notices yellow. The packet view has a green border. `--tui` with `pcap` still
-needs capture privileges.
+notices yellow. The metrics header shows open/total connections, current
+in/out packet and byte rates, and a 60-second aggregate throughput sparkline.
+Closed connection records and their final counters are retained for future
+filtering (10,000 by default). Tune these bounds with `--conn-history` and
+`--rate-history`. Packet counts are source-specific: pcap counts captured TCP
+segments, including control packets, while MITM counts plaintext logical reads.
+The packet view has a green border. `--tui` with `pcap` still needs capture
+privileges.
 
 ## Installation
 
