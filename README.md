@@ -108,8 +108,9 @@ Keybindings:
 
 The direction symbol is highlighted in a high-contrast colour (`[F→B]` cyan,
 `[B→F]` magenta) and the packet name is bold; warnings are red and connection
-notices yellow. The metrics header shows open/total connections, current
-in/out packet and byte rates, and a 60-second aggregate throughput sparkline.
+notices yellow. The metrics header shows active and total connections,
+cumulative in/out bytes and packet counts with current byte rates, and
+60-second packets-per-second sparklines (in cyan, out magenta).
 Closed connection records and their final counters are retained for future
 filtering (10,000 by default). Tune these bounds with `--conn-history` and
 `--rate-history`. Packet counts are source-specific: pcap counts captured TCP
