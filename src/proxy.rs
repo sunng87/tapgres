@@ -173,11 +173,9 @@ async fn handle_connection(
         // Cleartext Startup (or anything else): these 8 bytes begin it.
         head.to_vec()
     };
-    if !initial.is_empty() {
-        // Count the cleartext Startup read. SSL/GSS negotiation and TLS
-        // handshake bytes are transport overhead outside the application edge.
-        metrics.record(&stats, TrafficDirection::In, initial.len());
-    }
+    // The cleartext Startup's first 8 bytes (read above to detect
+    // SSL/GSS/cancel) are forwarded upstream below and also fed back into the
+    // client decoder by the pump, so they no longer need ad-hoc counting here.
 
     let client_stream: ProxyStream = if client_tls {
         let acceptor = TlsAcceptor::from(tls.server_config.clone());
@@ -221,6 +219,7 @@ async fn handle_connection(
         Role::Server,
         metrics.clone(),
         stats.clone(),
+        Vec::new(),
     ));
     let mut to_server = tokio::spawn(pump(
         client_rd,
@@ -228,6 +227,7 @@ async fn handle_connection(
         Role::Client,
         metrics.clone(),
         stats.clone(),
+        initial,
     ));
     // Finish as soon as either side closes; abort the other half.
     tokio::select! {
@@ -255,14 +255,28 @@ async fn raw_relay(client: TcpStream, server: TcpStream) -> io::Result<()> {
 }
 
 /// Read plaintext from `from`, decode it as pgwire, and forward it to `to`.
+///
+/// `prefix` carries bytes the caller already peeled off the stream (the
+/// cleartext Startup's length+protocol on the client leg) so the decoder sees
+/// a complete message stream; those bytes were already forwarded to `to`
+/// separately, so they are decoded here but not re-written.
 async fn pump(
     mut from: tokio::io::ReadHalf<ProxyStream>,
     mut to: tokio::io::WriteHalf<ProxyStream>,
     role: Role,
     metrics: Arc<Metrics>,
     stats: Arc<ConnStats>,
+    prefix: Vec<u8>,
 ) -> io::Result<()> {
     let mut dir = Direction::for_decoding(role);
+    let direction = if role == Role::Client {
+        TrafficDirection::In
+    } else {
+        TrafficDirection::Out
+    };
+    if !prefix.is_empty() {
+        dir.rxbuf.extend_from_slice(&prefix);
+    }
     let mut buf = vec![0u8; 16 * 1024];
     loop {
         let n = from.read(&mut buf).await?;
@@ -270,22 +284,16 @@ async fn pump(
             let _ = to.shutdown().await;
             return Ok(());
         }
-        // MITM packets are logical reads. Bytes consumed inside the TLS
-        // wrappers are intentionally outside these application-edge counters.
-        metrics.record(
-            &stats,
-            if role == Role::Client {
-                TrafficDirection::In
-            } else {
-                TrafficDirection::Out
-            },
-            n,
-        );
         // Decode the freshly arrived plaintext (the decoder buffers partial
-        // messages across calls), then forward the bytes untouched.
+        // messages across reads), count the decoded pgwire messages, then
+        // forward the bytes untouched. Bytes hidden inside TLS are
+        // intentionally outside these application-edge counters.
         dir.rxbuf.extend_from_slice(&buf[..n]);
         let mut outcome = DrainOutcome::default();
         decode::drain_direction(&mut dir, &mut outcome);
+        if outcome.msgs > 0 {
+            metrics.record_messages(&stats, direction, outcome.msgs, outcome.bytes);
+        }
         to.write_all(&buf[..n]).await?;
     }
 }

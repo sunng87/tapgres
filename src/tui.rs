@@ -228,24 +228,24 @@ fn draw(frame: &mut Frame, app: &App, log_h: usize) {
     let metrics = app.metrics.summary();
     let current = metrics.rates.last().copied().unwrap_or_default();
 
-    // Packets-per-second series over the rate window. In is cyan and out is
-    // magenta to match the [F→B]/[B→F] colour scheme used in the packet view.
-    let pkts_in: Vec<u64> = metrics.rates.iter().map(|r| r.pkts_in).collect();
-    let pkts_out: Vec<u64> = metrics.rates.iter().map(|r| r.pkts_out).collect();
+    // Messages-per-second series over the rate window. In is cyan and out is
+    // magenta to match the [F→B]/[B→F] colour scheme used in the message view.
+    let msgs_in: Vec<u64> = metrics.rates.iter().map(|r| r.msgs_in).collect();
+    let msgs_out: Vec<u64> = metrics.rates.iter().map(|r| r.msgs_out).collect();
     let combined: Vec<u64> = metrics
         .rates
         .iter()
-        .map(|r| r.pkts_in.saturating_add(r.pkts_out))
+        .map(|r| r.msgs_in.saturating_add(r.msgs_out))
         .collect();
     let avg = combined.iter().copied().sum::<u64>() / combined.len().max(1) as u64;
     let peak = combined.iter().copied().max().unwrap_or(0);
-    let now = current.pkts_in.saturating_add(current.pkts_out);
+    let now = current.msgs_in.saturating_add(current.msgs_out);
 
     let header_block = Block::bordered().title_top(Line::raw(heading));
     let header_inner = header_block.inner(title_area);
     frame.render_widget(header_block, title_area);
 
-    // Active | total in | total out | packets-per-second — four equal columns.
+    // Active | total in | total out | messages-per-second — four equal columns.
     let [active_area, in_area, out_area, chart_area] =
         Layout::horizontal([Constraint::Fill(1); 4]).areas(header_inner);
 
@@ -264,7 +264,7 @@ fn draw(frame: &mut Frame, app: &App, log_h: usize) {
             "TOTAL IN",
             human(metrics.bytes_in),
             Color::Cyan,
-            format!("{} pkts", with_commas(metrics.pkts_in)),
+            format!("{} msgs", with_commas(metrics.msgs_in)),
             format!("{}/s", human(current.bytes_in)),
         ),
         in_area,
@@ -274,7 +274,7 @@ fn draw(frame: &mut Frame, app: &App, log_h: usize) {
             "TOTAL OUT",
             human(metrics.bytes_out),
             Color::Magenta,
-            format!("{} pkts", with_commas(metrics.pkts_out)),
+            format!("{} msgs", with_commas(metrics.msgs_out)),
             format!("{}/s", human(current.bytes_out)),
         ),
         out_area,
@@ -290,7 +290,7 @@ fn draw(frame: &mut Frame, app: &App, log_h: usize) {
     .areas(chart_area);
     frame.render_widget(
         Paragraph::new(Text::styled(
-            "PACKETS/SEC",
+            "MESSAGES/SEC",
             Style::default().fg(Color::DarkGray),
         )),
         chart_label,
@@ -309,7 +309,7 @@ fn draw(frame: &mut Frame, app: &App, log_h: usize) {
     frame.render_widget(
         Sparkline::default()
             .direction(RenderDirection::RightToLeft)
-            .data(pkts_in.iter().rev())
+            .data(msgs_in.iter().rev())
             .style(Style::default().fg(Color::Cyan)),
         in_spark,
     );
@@ -325,7 +325,7 @@ fn draw(frame: &mut Frame, app: &App, log_h: usize) {
     frame.render_widget(
         Sparkline::default()
             .direction(RenderDirection::RightToLeft)
-            .data(pkts_out.iter().rev())
+            .data(msgs_out.iter().rev())
             .style(Style::default().fg(Color::Magenta)),
         out_spark,
     );
@@ -342,9 +342,9 @@ fn draw(frame: &mut Frame, app: &App, log_h: usize) {
         chart_cap,
     );
 
-    // --- packet view ---
+    // --- message view ---
     let log_block = Block::bordered()
-        .title_top(Line::raw(" packets "))
+        .title_top(Line::raw(" messages "))
         .border_style(Style::default().fg(Color::Green));
     let inner_w = log_area.width.saturating_sub(2) as usize;
     // Size the window by display rows so every shown item is fully visible (no
@@ -479,7 +479,7 @@ fn wrap_window(
 }
 
 /// Render a line with the direction symbol (`[F→B]`/`[B→F]`) highlighted in a
-/// high-contrast colour (F→B cyan, B→F magenta, bold) and the packet name
+/// high-contrast colour (F→B cyan, B→F magenta, bold) and the message name
 /// (e.g. `Query`, `DataRow`) bold; all other text stays the default colour for
 /// easy reading. Warnings stay red and connection notices yellow.
 fn build_line(line: &str) -> Line<'_> {

@@ -6,6 +6,7 @@
 //! packet-capture privileges.
 
 use std::net::{IpAddr, Ipv4Addr};
+use std::sync::Arc;
 
 use bytes::{BufMut, BytesMut};
 
@@ -24,6 +25,7 @@ use pgwire::messages::startup::{
 use tapgres::decode;
 use tapgres::flow::ConnTable;
 use tapgres::net::TcpSegment;
+use tapgres::state::Metrics;
 
 const CLI: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
 const SRV: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
@@ -421,6 +423,61 @@ fn replay_gss_refused_then_cleartext() {
     assert_contains(&joined, "Startup");
     assert_contains(&joined, "Authentication: Ok");
     assert!(!joined.contains("encrypted"));
+}
+
+/// The metrics counters must count decoded pgwire messages (and their wire
+/// bytes), not TCP segments or socket reads. Feeds a small SSL-refused session
+/// through the connection tracker and asserts the aggregate counts.
+#[test]
+fn counts_pgwire_messages_not_segments() {
+    // client→server: SSLRequest, Startup, Query
+    let mut fb = BytesMut::new();
+    Fm::SslNegotiation(SslNegotiationMetaMessage::PostgresSsl(SslRequest::new()))
+        .encode(&mut fb)
+        .unwrap();
+    let mut startup = Startup::new();
+    startup.parameters.insert("user".into(), "pgtest".into());
+    Fm::Startup(startup).encode(&mut fb).unwrap();
+    Fm::Query(Query::new("SELECT 1".into()))
+        .encode(&mut fb)
+        .unwrap();
+
+    // server→client: refuse SSL, Authentication Ok, ReadyForQuery
+    let mut bb = BytesMut::new();
+    Bm::SslResponse(SslResponse::Refuse)
+        .encode(&mut bb)
+        .unwrap();
+    Bm::Authentication(Authentication::Ok)
+        .encode(&mut bb)
+        .unwrap();
+    Bm::ReadyForQuery(ReadyForQuery::new(TransactionStatus::Idle))
+        .encode(&mut bb)
+        .unwrap();
+
+    let metrics = Arc::new(Metrics::new());
+    decode::start_capture();
+    let mut table = ConnTable::with_metrics(metrics.clone());
+    let mut c = Feeder::client(6_000, 40_010);
+    let mut s = Feeder::server(6_500, 40_010);
+
+    c.syn(&mut table);
+    s.syn(&mut table);
+    let (ssl_req, rest_c) = fb.split_at(8);
+    c.data(&mut table, ssl_req); // arms the server for the 1-byte reply
+    let (refuse, rest_s) = bb.split_at(1);
+    s.data(&mut table, refuse);
+    c.data(&mut table, rest_c);
+    s.data(&mut table, rest_s);
+    let _ = decode::take_capture();
+
+    let snap = metrics.snapshot();
+    // 3 frontend messages (SSLRequest + Startup + Query) and 3 backend
+    // messages (SslResponse + Authentication + ReadyForQuery), split across
+    // several segments — proving the count is per-message, not per-segment.
+    assert_eq!(snap.msgs_in, 3);
+    assert_eq!(snap.msgs_out, 3);
+    assert_eq!(snap.bytes_in, fb.len() as u64);
+    assert_eq!(snap.bytes_out, bb.len() as u64);
 }
 
 fn assert_contains(haystack: &str, needle: &str) {

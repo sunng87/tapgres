@@ -180,6 +180,11 @@ pub struct DrainOutcome {
     /// Set by the server direction when it observed an accepted SSL/GSS
     /// response — the connection is now encrypted.
     pub encrypted: bool,
+    /// Number of pgwire messages decoded this drain (for the drained
+    /// direction). The no-consume SSL/GSS "None" peek is excluded.
+    pub msgs: u64,
+    /// Wire bytes consumed by those decoded messages.
+    pub bytes: u64,
 }
 
 /// Repeatedly decode messages from `dir`'s buffer until it runs dry.
@@ -192,10 +197,12 @@ pub fn drain_direction(dir: &mut Direction, outcome: &mut DrainOutcome) {
     }
     if dir.role == Role::Client {
         loop {
+            let before = dir.rxbuf.len();
             match PgWireFrontendMessage::decode(&mut dir.rxbuf, &dir.ctx) {
                 Ok(None) => return,
                 Ok(Some(msg)) => {
-                    if !handle_frontend(dir, msg, outcome) {
+                    let consumed = before.saturating_sub(dir.rxbuf.len()) as u64;
+                    if !handle_frontend(dir, msg, outcome, consumed) {
                         return;
                     }
                 }
@@ -207,9 +214,13 @@ pub fn drain_direction(dir: &mut Direction, outcome: &mut DrainOutcome) {
         }
     } else {
         loop {
+            let before = dir.rxbuf.len();
             match PgWireBackendMessage::decode(&mut dir.rxbuf, &dir.ctx) {
                 Ok(None) => return,
-                Ok(Some(msg)) => handle_backend(dir, msg, outcome),
+                Ok(Some(msg)) => {
+                    let consumed = before.saturating_sub(dir.rxbuf.len()) as u64;
+                    handle_backend(dir, msg, outcome, consumed);
+                }
                 Err(e) => {
                     decode_error(Role::Server, &e, &mut dir.rxbuf);
                     return;
@@ -241,11 +252,25 @@ fn role_dbg(role: Role) -> &'static str {
 }
 
 /// Handle one frontend message. Returns `false` to stop draining.
+///
+/// `consumed` is the wire bytes the message took from the buffer; it is added
+/// to the outcome counters for every real message. The SSL/GSS "None" variant
+/// is a no-consume peek (the bytes stay for the next Startup decode) and is
+/// not counted.
 fn handle_frontend(
     dir: &mut Direction,
     msg: PgWireFrontendMessage,
     outcome: &mut DrainOutcome,
+    consumed: u64,
 ) -> bool {
+    let is_peek = matches!(
+        msg,
+        PgWireFrontendMessage::SslNegotiation(SslNegotiationMetaMessage::None)
+    );
+    if !is_peek {
+        outcome.msgs += 1;
+        outcome.bytes += consumed;
+    }
     match msg {
         PgWireFrontendMessage::SslNegotiation(meta) => match meta {
             // Neither SSL nor GSS requested: clear the SSL-awaiting flag so the
@@ -310,8 +335,16 @@ fn handle_frontend(
     true
 }
 
-/// Handle one backend message.
-fn handle_backend(dir: &mut Direction, msg: PgWireBackendMessage, outcome: &mut DrainOutcome) {
+/// Handle one backend message. Every backend message is a real, emitted
+/// protocol event, so all of them are counted.
+fn handle_backend(
+    dir: &mut Direction,
+    msg: PgWireBackendMessage,
+    outcome: &mut DrainOutcome,
+    consumed: u64,
+) {
+    outcome.msgs += 1;
+    outcome.bytes += consumed;
     match msg {
         PgWireBackendMessage::Authentication(a) => {
             emit(Role::Server, "Authentication", &format_auth(&a))
