@@ -108,6 +108,11 @@ struct App {
     wrap: bool,
     mode: &'static str,
     metrics: Arc<Metrics>,
+    /// All-time peak messages/sec seen this session, per direction. Used as a
+    /// fixed sparkline scale so bars don't rescale as the rate window slides;
+    /// the value only ever grows.
+    peak_msgs_in: u64,
+    peak_msgs_out: u64,
 }
 
 impl App {
@@ -120,6 +125,8 @@ impl App {
             wrap: false,
             mode,
             metrics,
+            peak_msgs_in: 0,
+            peak_msgs_out: 0,
         }
     }
 }
@@ -153,6 +160,19 @@ fn app_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Result
             app.scroll = max_scroll;
         }
         app.scroll = app.scroll.min(max_scroll);
+
+        // Fixed sparkline scale: track the all-time peak messages/sec per
+        // direction so the bars keep a stable scale instead of rescaling to
+        // the current window's max as samples expire or arrive.
+        {
+            let summary = app.metrics.summary();
+            app.peak_msgs_in = app
+                .peak_msgs_in
+                .max(summary.rates.iter().map(|r| r.msgs_in).max().unwrap_or(0));
+            app.peak_msgs_out = app
+                .peak_msgs_out
+                .max(summary.rates.iter().map(|r| r.msgs_out).max().unwrap_or(0));
+        }
 
         terminal.draw(|frame| draw(frame, &app, log_h))?;
 
@@ -310,6 +330,7 @@ fn draw(frame: &mut Frame, app: &App, log_h: usize) {
         Sparkline::default()
             .direction(RenderDirection::RightToLeft)
             .data(msgs_in.iter().rev())
+            .max(app.peak_msgs_in.max(1))
             .style(Style::default().fg(Color::Cyan)),
         in_spark,
     );
@@ -326,6 +347,7 @@ fn draw(frame: &mut Frame, app: &App, log_h: usize) {
         Sparkline::default()
             .direction(RenderDirection::RightToLeft)
             .data(msgs_out.iter().rev())
+            .max(app.peak_msgs_out.max(1))
             .style(Style::default().fg(Color::Magenta)),
         out_spark,
     );
