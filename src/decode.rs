@@ -14,6 +14,7 @@ use crossbeam_channel::Sender;
 use bytes::{Buf, Bytes};
 use chrono::Local;
 
+use crate::filter::{DisplayFilter, DisplayMessage, MessageDirection};
 use crate::flow::{Direction, Role};
 
 // Pull in only the protocol-layer message definitions.
@@ -88,21 +89,49 @@ pub fn ts() -> String {
 // Thread-local `CAPTURE` is a higher-priority short-circuit so the integration
 // tests can assert decoded output without spinning up a consumer.
 thread_local! {
-    static CAPTURE: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+    static CAPTURE: RefCell<Option<Vec<Output>>> = const { RefCell::new(None) };
 }
 
 /// What kind of output a record is, so the consumer can route it (decoded lines
 /// to stdout, status to stderr) without re-parsing the text.
 #[derive(Debug, Clone)]
 pub enum Output {
-    /// A decoded protocol line.
+    /// A decoded protocol message with filter metadata and optional structured
+    /// detail for the TUI's rich display mode.
+    Message {
+        message: DisplayMessage,
+        detail: Option<EventDetail>,
+    },
+    /// An unstructured capture/lifecycle line.
     Line(String),
     /// A status/informational line.
     Status(String),
-    /// A decoded protocol line plus structured `detail` the TUI may render in
-    /// rich mode. `text` is the same line-view string the other variants
-    /// carry; stdout consumers just print `text` and ignore `detail`.
-    Rich { text: String, detail: EventDetail },
+}
+
+impl Output {
+    pub fn rendered(&self) -> &str {
+        match self {
+            Output::Message { message, .. } => &message.rendered,
+            Output::Line(line) | Output::Status(line) => line,
+        }
+    }
+
+    /// Whether this record belongs in a filtered display. Operational records
+    /// remain visible because they carry capture failures and connection
+    /// lifecycle context rather than decoded PostgreSQL messages.
+    pub fn matches_filter(&self, filter: &DisplayFilter) -> bool {
+        match self {
+            Output::Message { message, .. } => filter.matches(message),
+            Output::Line(_) | Output::Status(_) => true,
+        }
+    }
+
+    pub fn detail(&self) -> Option<&EventDetail> {
+        match self {
+            Output::Message { detail, .. } => detail.as_ref(),
+            Output::Line(_) | Output::Status(_) => None,
+        }
+    }
 }
 
 /// The global producer handle. `None` (the default) means no consumer is wired
@@ -125,14 +154,7 @@ fn deliver(record: Output) {
     // Tests capture decoded lines locally (no consumer thread / channel).
     let buffered = CAPTURE.with(|c| c.borrow().is_some());
     if buffered {
-        // The line-view text is what tests assert on; `Rich` carries that same
-        // text, so capture it like a `Line` and drop the structured detail.
-        match record {
-            Output::Line(s) | Output::Rich { text: s, .. } => {
-                CAPTURE.with(|c| c.borrow_mut().as_mut().unwrap().push(s));
-            }
-            Output::Status(_) => {}
-        }
+        CAPTURE.with(|c| c.borrow_mut().as_mut().unwrap().push(record));
         return;
     }
     if let Some(tx) = &*OUTPUT_TX.lock().unwrap() {
@@ -141,7 +163,8 @@ fn deliver(record: Output) {
     }
     // No consumer wired: fall back to direct terminal output.
     match record {
-        Output::Line(s) | Output::Rich { text: s, .. } => println!("{s}"),
+        Output::Message { message, .. } => println!("{}", message.rendered),
+        Output::Line(s) => println!("{s}"),
         Output::Status(s) => eprintln!("{s}"),
     }
 }
@@ -150,13 +173,6 @@ fn deliver(record: Output) {
 /// none is wired.
 pub fn out(line: String) {
     deliver(Output::Line(line));
-}
-
-/// Emit a decoded protocol line with structured `detail` for the TUI's rich
-/// mode. `line` is exactly the text the line view would show; stdout consumers
-/// print it unchanged.
-pub fn out_rich(line: String, detail: EventDetail) {
-    deliver(Output::Rich { text: line, detail });
 }
 
 /// Emit a status/informational line. On the stdout path it goes to stderr; under
@@ -172,6 +188,15 @@ pub fn start_capture() {
 
 /// Finish capturing and return the buffered lines.
 pub fn take_capture() -> Vec<String> {
+    take_output_capture()
+        .into_iter()
+        .filter(|output| !matches!(output, Output::Status(_)))
+        .map(|output| output.rendered().to_string())
+        .collect()
+}
+
+/// Finish capturing and return structured output records.
+pub fn take_output_capture() -> Vec<Output> {
     CAPTURE.with(|c| c.borrow_mut().take().unwrap_or_default())
 }
 
@@ -183,27 +208,60 @@ fn dir_tag(role: Role) -> &'static str {
     }
 }
 
-fn emit(role: Role, kind: &str, text: &str) {
-    if text.is_empty() {
-        out(format!("[{}] [{}] {}", ts(), dir_tag(role), kind));
-    } else {
-        out(format!("[{}] [{}] {}: {}", ts(), dir_tag(role), kind, text));
+#[derive(Clone, Copy)]
+struct MessageEmitter {
+    role: Role,
+    client: std::net::SocketAddr,
+}
+
+impl MessageEmitter {
+    fn emit(self, kind: &str, text: &str) {
+        self.emit_with_detail(kind, text, None);
     }
-}
 
-/// Like [`emit`] but attaches structured `detail` for rich-mode rendering.
-/// The line text is built identically to [`emit`].
-fn emit_rich(role: Role, kind: &str, text: &str, detail: EventDetail) {
-    let line = if text.is_empty() {
-        format!("[{}] [{}] {}", ts(), dir_tag(role), kind)
-    } else {
-        format!("[{}] [{}] {}: {}", ts(), dir_tag(role), kind, text)
-    };
-    out_rich(line, detail);
-}
+    fn emit_rich(self, kind: &str, text: &str, detail: EventDetail) {
+        self.emit_with_detail(kind, text, Some(detail));
+    }
 
-fn warn(role: Role, msg: &str) {
-    out(format!("[{}] [{}] ⚠ {}", ts(), dir_tag(role), msg));
+    fn emit_with_detail(self, kind: &str, text: &str, detail: Option<EventDetail>) {
+        let rendered = if text.is_empty() {
+            format!("[{}] [{}] {}", ts(), dir_tag(self.role), kind)
+        } else {
+            format!("[{}] [{}] {}: {}", ts(), dir_tag(self.role), kind, text)
+        };
+        deliver(Output::Message {
+            message: DisplayMessage {
+                rendered,
+                client: self.client,
+                direction: if self.role == Role::Client {
+                    MessageDirection::FrontendToBackend
+                } else {
+                    MessageDirection::BackendToFrontend
+                },
+                kind: kind.to_string(),
+                text: text.to_string(),
+            },
+            detail,
+        });
+    }
+
+    fn warn(self, msg: &str) {
+        let rendered = format!("[{}] [{}] ⚠ {}", ts(), dir_tag(self.role), msg);
+        deliver(Output::Message {
+            message: DisplayMessage {
+                rendered,
+                client: self.client,
+                direction: if self.role == Role::Client {
+                    MessageDirection::FrontendToBackend
+                } else {
+                    MessageDirection::BackendToFrontend
+                },
+                kind: "Warning".into(),
+                text: msg.to_string(),
+            },
+            detail: None,
+        });
+    }
 }
 
 /// Signal that the *server* side should now expect a 1-byte SSL or GSS
@@ -315,6 +373,10 @@ fn handle_frontend(
     outcome: &mut DrainOutcome,
     consumed: u64,
 ) -> bool {
+    let emitter = MessageEmitter {
+        role: dir.role,
+        client: dir.client,
+    };
     let is_peek = matches!(
         msg,
         PgWireFrontendMessage::SslNegotiation(SslNegotiationMetaMessage::None)
@@ -337,52 +399,46 @@ fn handle_frontend(
             SslNegotiationMetaMessage::PostgresSsl(_) => {
                 dir.ctx.awaiting_frontend_ssl = false;
                 outcome.server_negotiation_wait = ServerNegotiationWait::Ssl;
-                emit(Role::Client, "SSLRequest", "(awaiting server reply)");
+                emitter.emit("SSLRequest", "(awaiting server reply)");
                 return false;
             }
             SslNegotiationMetaMessage::PostgresGss(_) => {
                 dir.ctx.awaiting_frontend_ssl = false;
                 outcome.server_negotiation_wait = ServerNegotiationWait::Gss;
-                emit(Role::Client, "GssEncRequest", "(awaiting server reply)");
+                emitter.emit("GssEncRequest", "(awaiting server reply)");
                 return false;
             }
         },
         PgWireFrontendMessage::Startup(s) => {
             // Startup consumed: from now on bytes are typed frontend messages.
             dir.ctx.awaiting_frontend_startup = false;
-            emit(Role::Client, "Startup", &format_startup(&s));
+            emitter.emit("Startup", &format_startup(&s));
         }
         PgWireFrontendMessage::CancelRequest(_) => {
-            emit(Role::Client, "CancelRequest", "");
+            emitter.emit("CancelRequest", "");
         }
         PgWireFrontendMessage::Query(q) => {
-            emit(Role::Client, "Query", &query_text(&q));
+            emitter.emit("Query", &query_text(&q));
         }
-        PgWireFrontendMessage::Parse(p) => emit(Role::Client, "Parse", &format_parse(&p)),
-        PgWireFrontendMessage::Bind(b) => emit(Role::Client, "Bind", &format_bind(&b)),
-        PgWireFrontendMessage::Describe(d) => emit(
-            Role::Client,
-            "Describe",
-            &format_describe_close(d.target_type, &d.name),
-        ),
-        PgWireFrontendMessage::Execute(e) => emit(Role::Client, "Execute", &format_execute(&e)),
-        PgWireFrontendMessage::Close(c) => emit(
-            Role::Client,
-            "Close",
-            &format_describe_close(c.target_type, &c.name),
-        ),
-        PgWireFrontendMessage::Sync(_) => emit(Role::Client, "Sync", ""),
-        PgWireFrontendMessage::Flush(_) => emit(Role::Client, "Flush", ""),
-        PgWireFrontendMessage::Terminate(_) => emit(Role::Client, "Terminate", ""),
+        PgWireFrontendMessage::Parse(p) => emitter.emit("Parse", &format_parse(&p)),
+        PgWireFrontendMessage::Bind(b) => emitter.emit("Bind", &format_bind(&b)),
+        PgWireFrontendMessage::Describe(d) => {
+            emitter.emit("Describe", &format_describe_close(d.target_type, &d.name))
+        }
+        PgWireFrontendMessage::Execute(e) => emitter.emit("Execute", &format_execute(&e)),
+        PgWireFrontendMessage::Close(c) => {
+            emitter.emit("Close", &format_describe_close(c.target_type, &c.name))
+        }
+        PgWireFrontendMessage::Sync(_) => emitter.emit("Sync", ""),
+        PgWireFrontendMessage::Flush(_) => emitter.emit("Flush", ""),
+        PgWireFrontendMessage::Terminate(_) => emitter.emit("Terminate", ""),
         PgWireFrontendMessage::PasswordMessageFamily(pmf) => {
-            emit(Role::Client, "AuthData", &format_pmf(&pmf))
+            emitter.emit("AuthData", &format_pmf(&pmf))
         }
-        PgWireFrontendMessage::CopyData(c) => {
-            emit(Role::Client, "CopyData", &format_bytes(&c.data))
-        }
-        PgWireFrontendMessage::CopyFail(f) => emit(Role::Client, "CopyFail", &f.message),
-        PgWireFrontendMessage::CopyDone(_) => emit(Role::Client, "CopyDone", ""),
-        PgWireFrontendMessage::PortalSuspended(_) => emit(Role::Client, "PortalSuspended", ""),
+        PgWireFrontendMessage::CopyData(c) => emitter.emit("CopyData", &format_bytes(&c.data)),
+        PgWireFrontendMessage::CopyFail(f) => emitter.emit("CopyFail", &f.message),
+        PgWireFrontendMessage::CopyDone(_) => emitter.emit("CopyDone", ""),
+        PgWireFrontendMessage::PortalSuspended(_) => emitter.emit("PortalSuspended", ""),
     }
     true
 }
@@ -395,47 +451,39 @@ fn handle_backend(
     outcome: &mut DrainOutcome,
     consumed: u64,
 ) {
+    let emitter = MessageEmitter {
+        role: dir.role,
+        client: dir.client,
+    };
     outcome.msgs += 1;
     outcome.bytes += consumed;
     match msg {
-        PgWireBackendMessage::Authentication(a) => {
-            emit(Role::Server, "Authentication", &format_auth(&a))
+        PgWireBackendMessage::Authentication(a) => emitter.emit("Authentication", &format_auth(&a)),
+        PgWireBackendMessage::ParameterStatus(p) => {
+            emitter.emit("ParameterStatus", &format!("{}={}", p.name, p.value))
         }
-        PgWireBackendMessage::ParameterStatus(p) => emit(
-            Role::Server,
-            "ParameterStatus",
-            &format!("{}={}", p.name, p.value),
-        ),
-        PgWireBackendMessage::BackendKeyData(b) => {
-            emit(Role::Server, "BackendKeyData", &format_bkd(&b))
+        PgWireBackendMessage::BackendKeyData(b) => emitter.emit("BackendKeyData", &format_bkd(&b)),
+        PgWireBackendMessage::NegotiateProtocolVersion(n) => {
+            emitter.emit("NegotiateProtocolVersion", &format_negotiate(&n))
         }
-        PgWireBackendMessage::NegotiateProtocolVersion(n) => emit(
-            Role::Server,
-            "NegotiateProtocolVersion",
-            &format_negotiate(&n),
-        ),
-        PgWireBackendMessage::ReadyForQuery(r) => emit(
-            Role::Server,
-            "ReadyForQuery",
-            &format!("txn={}", txn_status(r.status)),
-        ),
-        PgWireBackendMessage::CommandComplete(c) => emit(Role::Server, "CommandComplete", &c.tag),
-        PgWireBackendMessage::EmptyQueryResponse(_) => emit(Role::Server, "EmptyQueryResponse", ""),
+        PgWireBackendMessage::ReadyForQuery(r) => {
+            emitter.emit("ReadyForQuery", &format!("txn={}", txn_status(r.status)))
+        }
+        PgWireBackendMessage::CommandComplete(c) => emitter.emit("CommandComplete", &c.tag),
+        PgWireBackendMessage::EmptyQueryResponse(_) => emitter.emit("EmptyQueryResponse", ""),
         PgWireBackendMessage::ErrorResponse(e) => {
-            emit(Role::Server, "ERROR", &format_error_fields(&e.fields))
+            emitter.emit("ERROR", &format_error_fields(&e.fields))
         }
         PgWireBackendMessage::NoticeResponse(n) => {
-            emit(Role::Server, "NOTICE", &format_error_fields(&n.fields))
+            emitter.emit("NOTICE", &format_error_fields(&n.fields))
         }
-        PgWireBackendMessage::NotificationResponse(n) => emit(
-            Role::Server,
+        PgWireBackendMessage::NotificationResponse(n) => emitter.emit(
             "NOTIFY",
             &format!("channel={:?} payload={:?}", n.channel, n.payload),
         ),
         PgWireBackendMessage::RowDescription(r) => {
             let summary: Vec<FieldSummary> = r.fields.iter().map(FieldSummary::from).collect();
-            emit_rich(
-                Role::Server,
+            emitter.emit_rich(
                 "RowDescription",
                 &format_row_desc(&summary),
                 EventDetail::RowDescription(summary.clone()),
@@ -448,7 +496,7 @@ fn handle_backend(
         }
         PgWireBackendMessage::NoData(_) => {
             dir.row_desc = None;
-            emit(Role::Server, "NoData", "");
+            emitter.emit("NoData", "");
         }
         PgWireBackendMessage::DataRow(r) => {
             // Pair the row with the cached description up front so we both
@@ -458,46 +506,34 @@ fn handle_backend(
             let columns = data_row_columns(&r, desc);
             let text = format_columns(&columns, desc.is_some());
             if desc.is_some() {
-                emit_rich(
-                    Role::Server,
-                    "DataRow",
-                    &text,
-                    EventDetail::DataRow(columns),
-                );
+                emitter.emit_rich("DataRow", &text, EventDetail::DataRow(columns));
             } else {
                 // No cached description -> nothing to key a table on; emit the
                 // flat line view only.
-                emit(Role::Server, "DataRow", &text);
+                emitter.emit("DataRow", &text);
             }
         }
         PgWireBackendMessage::ParameterDescription(p) => {
-            emit(Role::Server, "ParameterDescription", &format_oids(&p.types))
+            emitter.emit("ParameterDescription", &format_oids(&p.types))
         }
-        PgWireBackendMessage::ParseComplete(_) => emit(Role::Server, "ParseComplete", ""),
-        PgWireBackendMessage::BindComplete(_) => emit(Role::Server, "BindComplete", ""),
-        PgWireBackendMessage::CloseComplete(_) => emit(Role::Server, "CloseComplete", ""),
-        PgWireBackendMessage::PortalSuspended(_) => emit(Role::Server, "PortalSuspended", ""),
+        PgWireBackendMessage::ParseComplete(_) => emitter.emit("ParseComplete", ""),
+        PgWireBackendMessage::BindComplete(_) => emitter.emit("BindComplete", ""),
+        PgWireBackendMessage::CloseComplete(_) => emitter.emit("CloseComplete", ""),
+        PgWireBackendMessage::PortalSuspended(_) => emitter.emit("PortalSuspended", ""),
         PgWireBackendMessage::SslResponse(s) => {
             // Consume the 1-byte response: this is one-shot, so clear the flag
             // regardless of the answer so normal messages decode afterwards.
             dir.ctx.awaiting_backend_ssl_response = false;
             match s {
                 SslResponse::Accept => {
-                    warn(
-                        Role::Server,
-                        "SSL accepted — connection is now encrypted, decoding stops here",
-                    );
+                    emitter.warn("SSL accepted — connection is now encrypted, decoding stops here");
                     outcome.encrypted = true;
                 }
                 SslResponse::Refuse => {
-                    emit(
-                        Role::Server,
-                        "SslResponse",
-                        "refuse (continuing in cleartext)",
-                    );
+                    emitter.emit("SslResponse", "refuse (continuing in cleartext)");
                 }
                 _ => {
-                    emit(Role::Server, "SslResponse", "unknown");
+                    emitter.emit("SslResponse", "unknown");
                 }
             }
         }
@@ -505,44 +541,30 @@ fn handle_backend(
             dir.ctx.awaiting_backend_gss_response = false;
             match s {
                 GssEncResponse::Accept => {
-                    warn(
-                        Role::Server,
-                        "GSS accepted — connection is now encrypted, decoding stops here",
-                    );
+                    emitter.warn("GSS accepted — connection is now encrypted, decoding stops here");
                     outcome.encrypted = true;
                 }
                 GssEncResponse::Refuse => {
-                    emit(
-                        Role::Server,
-                        "GssEncResponse",
-                        "refuse (continuing in cleartext)",
-                    );
+                    emitter.emit("GssEncResponse", "refuse (continuing in cleartext)");
                 }
                 _ => {
-                    emit(Role::Server, "GssEncResponse", "unknown");
+                    emitter.emit("GssEncResponse", "unknown");
                 }
             }
         }
-        PgWireBackendMessage::CopyInResponse(c) => emit(
-            Role::Server,
-            "CopyInResponse",
-            &format_copy_response("in", &c.columns),
-        ),
-        PgWireBackendMessage::CopyOutResponse(c) => emit(
-            Role::Server,
-            "CopyOutResponse",
-            &format_copy_response("out", &c.columns),
-        ),
-        PgWireBackendMessage::CopyBothResponse(c) => emit(
-            Role::Server,
+        PgWireBackendMessage::CopyInResponse(c) => {
+            emitter.emit("CopyInResponse", &format_copy_response("in", &c.columns))
+        }
+        PgWireBackendMessage::CopyOutResponse(c) => {
+            emitter.emit("CopyOutResponse", &format_copy_response("out", &c.columns))
+        }
+        PgWireBackendMessage::CopyBothResponse(c) => emitter.emit(
             "CopyBothResponse",
             &format_copy_response("both", &c.columns),
         ),
-        PgWireBackendMessage::CopyData(cd) => {
-            emit(Role::Server, "CopyData", &format_bytes(&cd.data))
-        }
-        PgWireBackendMessage::CopyFail(f) => emit(Role::Server, "CopyFail", &f.message),
-        PgWireBackendMessage::CopyDone(_) => emit(Role::Server, "CopyDone", ""),
+        PgWireBackendMessage::CopyData(cd) => emitter.emit("CopyData", &format_bytes(&cd.data)),
+        PgWireBackendMessage::CopyFail(f) => emitter.emit("CopyFail", &f.message),
+        PgWireBackendMessage::CopyDone(_) => emitter.emit("CopyDone", ""),
     }
 }
 
@@ -983,5 +1005,60 @@ mod tests {
         assert_eq!(cols[0].value, "'x'");
         assert_eq!(cols[1].value, "'y'");
         assert_eq!(format_columns(&cols, false), "['x', 'y']");
+    }
+
+    #[test]
+    fn decoded_output_carries_filter_metadata() {
+        start_capture();
+        MessageEmitter {
+            role: Role::Client,
+            client: "127.0.0.1:40005".parse().unwrap(),
+        }
+        .emit("Query", "SELECT * FROM orders");
+
+        let output = take_output_capture();
+        let Output::Message { message, detail } = &output[0] else {
+            panic!("expected structured decoded message");
+        };
+        assert!(detail.is_none());
+        assert_eq!(message.client, "127.0.0.1:40005".parse().unwrap());
+        assert_eq!(message.direction, MessageDirection::FrontendToBackend);
+        assert_eq!(message.kind, "Query");
+        assert_eq!(message.text, "SELECT * FROM orders");
+        assert!(
+            message
+                .rendered
+                .contains("[F→B] Query: SELECT * FROM orders")
+        );
+    }
+
+    #[test]
+    fn filters_only_decoded_messages() {
+        let filter = DisplayFilter::parse("type=Query keyword=orders").unwrap();
+        let query = Output::Message {
+            message: DisplayMessage {
+                rendered: "query".into(),
+                client: "127.0.0.1:40005".parse().unwrap(),
+                direction: MessageDirection::FrontendToBackend,
+                kind: "Query".into(),
+                text: "SELECT * FROM orders".into(),
+            },
+            detail: None,
+        };
+        let row = Output::Message {
+            message: DisplayMessage {
+                rendered: "row".into(),
+                client: "127.0.0.1:40005".parse().unwrap(),
+                direction: MessageDirection::BackendToFrontend,
+                kind: "DataRow".into(),
+                text: "{ id=1 }".into(),
+            },
+            detail: None,
+        };
+
+        assert!(query.matches_filter(&filter));
+        assert!(!row.matches_filter(&filter));
+        assert!(Output::Status("capture started".into()).matches_filter(&filter));
+        assert!(Output::Line("=== connection ===".into()).matches_filter(&filter));
     }
 }

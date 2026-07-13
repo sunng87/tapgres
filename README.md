@@ -35,6 +35,7 @@ sources, selected with `--mode`, and an optional interactive view with `--tui`:
 tapgres -p 5432                 # monitor port 5432 on loopback (default)
 tapgres -p 5432 -i eth0         # capture on a specific interface
 tapgres -p 5432 -i any          # capture on all interfaces
+tapgres --filter 'type=Query keyword=orders'
 ```
 
 Capturing requires privileges (`CAP_NET_RAW` or root):
@@ -107,6 +108,33 @@ Keybindings:
 | `w` | toggle line wrap |
 | `r` | toggle rich display mode |
 | `c` | clear |
+| `/` | edit the display filter |
+| `Esc` | clear the active filter |
+
+### Display filters
+
+`--filter <expr>` limits decoded PostgreSQL messages in line-oriented output
+and supplies the initial filter in `--tui`. Conditions are combined with AND
+semantics:
+
+```sh
+tapgres --filter 'client=127.0.0.1 port=40005 type=Query|DataRow keyword="order id" dir=in'
+tapgres --tui --filter 'type=Ready*'
+```
+
+Supported fields are `client` (IP address), `port`, `type`, `keyword`, and the
+optional `dir` (`in`/`f2b` or `out`/`b2f`). Type values may be separated by
+`,` or `|` and support `*` and `?` globs. Type and keyword matching are
+case-insensitive; quote keyword values that contain spaces. Bare terms are
+also treated as keywords.
+
+In the TUI, press `/` to edit the filter. Valid edits are applied immediately
+to the full retained message buffer, so previously hidden messages reappear
+when the filter changes or is cleared. Invalid input is shown in the footer
+while the last valid filter remains active. Press `Enter` to leave the editor,
+or `Esc` (including an empty filter) to clear it. Capture errors and connection
+lifecycle notices remain visible because they are operational context rather
+than decoded protocol messages.
 
 **Rich display mode** (`r`, or `--tui-rich` at startup) renders structured
 messages differently from the flat line view: each `DataRow` becomes a
@@ -134,7 +162,8 @@ filtering (10,000 by default). Tune these bounds with `--conn-history` and
 stream (not TCP segments or socket reads), so they are consistent across the
 pcap and mitm sources; bytes that never form a complete message, and anything
 after SSL/GSS is accepted, are not counted.
-The message view has a green border. `--tui` with `pcap` still needs capture
+The message view border is green normally, yellow while a filter is active,
+and red for invalid filter input. `--tui` with `pcap` still needs capture
 privileges.
 
 ## Installation

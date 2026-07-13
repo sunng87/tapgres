@@ -10,7 +10,9 @@
 //! - `j`/`k`, arrows, `PgUp`/`PgDn`, `g`/`G` — scroll
 //! - `f` — toggle follow (auto-tail)
 //! - `w` — toggle line wrap
+//! - `r` — toggle rich message rendering
 //! - `c` — clear
+//! - `/` — edit the display filter
 
 use crossbeam_channel::Receiver;
 use std::error::Error;
@@ -27,6 +29,7 @@ use ratatui::widgets::{Block, Paragraph, RenderDirection, Sparkline, Wrap};
 
 use crate::capture::PcapOpts;
 use crate::decode::{self, Output};
+use crate::filter::DisplayFilter;
 use crate::proxy::ProxyOpts;
 use crate::state::Metrics;
 
@@ -34,7 +37,12 @@ use crate::state::Metrics;
 const HISTORY_CAP: usize = 50_000;
 
 /// TUI over the passive pcap capture.
-pub fn run_pcap(opts: PcapOpts, metrics: Arc<Metrics>, rich: bool) -> Result<(), Box<dyn Error>> {
+pub fn run_pcap(
+    opts: PcapOpts,
+    metrics: Arc<Metrics>,
+    rich: bool,
+    filter: DisplayFilter,
+) -> Result<(), Box<dyn Error>> {
     let source_metrics = metrics.clone();
     run(
         Box::new(move || {
@@ -45,11 +53,17 @@ pub fn run_pcap(opts: PcapOpts, metrics: Arc<Metrics>, rich: bool) -> Result<(),
         "pcap",
         metrics,
         rich,
+        filter,
     )
 }
 
 /// TUI over the TLS-terminating mitm proxy.
-pub fn run_mitm(opts: ProxyOpts, metrics: Arc<Metrics>, rich: bool) -> Result<(), Box<dyn Error>> {
+pub fn run_mitm(
+    opts: ProxyOpts,
+    metrics: Arc<Metrics>,
+    rich: bool,
+    filter: DisplayFilter,
+) -> Result<(), Box<dyn Error>> {
     let source_metrics = metrics.clone();
     run(
         Box::new(move || {
@@ -70,6 +84,7 @@ pub fn run_mitm(opts: ProxyOpts, metrics: Arc<Metrics>, rich: bool) -> Result<()
         "mitm",
         metrics,
         rich,
+        filter,
     )
 }
 
@@ -80,6 +95,7 @@ fn run(
     mode: &'static str,
     metrics: Arc<Metrics>,
     rich: bool,
+    filter: DisplayFilter,
 ) -> Result<(), Box<dyn Error>> {
     // One channel: the source (background thread) produces via decode::out,
     // the TUI (this thread) consumes.
@@ -93,18 +109,11 @@ fn run(
     let _rate_sampler = metrics.spawn_rate_sampler()?;
 
     let mut terminal = ratatui::try_init()?;
-    let result = app_loop(&mut terminal, App::new(rx, mode, metrics, rich));
+    let result = app_loop(&mut terminal, App::new(rx, mode, metrics, rich, filter));
     // Restore the terminal even on error. try_init installs a panic hook that
     // also restores, so panics are covered too.
     let _ = ratatui::try_restore();
     result.map_err(Into::into)
-}
-
-/// One retained decoded record: the line-view text plus, optionally, the
-/// structured detail the rich view renders instead of that text.
-struct Entry {
-    text: String,
-    detail: Option<decode::EventDetail>,
 }
 
 /// Rich-mode rendering options bundled together so the draw/window functions
@@ -117,7 +126,10 @@ struct View {
 
 struct App {
     rx: Receiver<Output>,
-    events: Vec<Entry>,
+    /// Complete retained history; filtering never removes entries from here.
+    events: Vec<Output>,
+    /// Indices into `events` that match the current display filter.
+    visible: Vec<usize>,
     /// Index of the top visible line into the event buffer.
     scroll: usize,
     /// Auto-tail new output.
@@ -135,13 +147,25 @@ struct App {
     /// the value only ever grows.
     peak_msgs_in: u64,
     peak_msgs_out: u64,
+    filter: DisplayFilter,
+    filter_text: String,
+    filter_error: Option<String>,
+    filter_editing: bool,
 }
 
 impl App {
-    fn new(rx: Receiver<Output>, mode: &'static str, metrics: Arc<Metrics>, rich: bool) -> Self {
+    fn new(
+        rx: Receiver<Output>,
+        mode: &'static str,
+        metrics: Arc<Metrics>,
+        rich: bool,
+        filter: DisplayFilter,
+    ) -> Self {
+        let filter_text = filter.expression().to_string();
         Self {
             rx,
             events: Vec::new(),
+            visible: Vec::new(),
             scroll: 0,
             follow: true,
             wrap: false,
@@ -150,28 +174,69 @@ impl App {
             metrics,
             peak_msgs_in: 0,
             peak_msgs_out: 0,
+            filter,
+            filter_text,
+            filter_error: None,
+            filter_editing: false,
         }
+    }
+
+    fn matches(&self, output: &Output) -> bool {
+        output.matches_filter(&self.filter)
+    }
+
+    fn push_output(&mut self, output: Output) {
+        let index = self.events.len();
+        if self.matches(&output) {
+            self.visible.push(index);
+        }
+        self.events.push(output);
+    }
+
+    fn rebuild_visible(&mut self) {
+        self.visible = self
+            .events
+            .iter()
+            .enumerate()
+            .filter_map(|(index, output)| self.matches(output).then_some(index))
+            .collect();
+        self.scroll = 0;
+    }
+
+    fn update_filter(&mut self) {
+        if self.filter_text.trim().is_empty() {
+            self.filter = DisplayFilter::default();
+            self.filter_error = None;
+            self.rebuild_visible();
+            return;
+        }
+        match DisplayFilter::parse(&self.filter_text) {
+            Ok(filter) => {
+                self.filter = filter;
+                self.filter_error = None;
+                self.rebuild_visible();
+            }
+            Err(error) => self.filter_error = Some(error.to_string()),
+        }
+    }
+
+    fn clear_filter(&mut self) {
+        self.filter_text.clear();
+        self.filter = DisplayFilter::default();
+        self.filter_error = None;
+        self.rebuild_visible();
     }
 }
 
 fn app_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Result<()> {
     loop {
         while let Ok(record) = app.rx.try_recv() {
-            let evt = match record {
-                Output::Line(s) | Output::Status(s) => Entry {
-                    text: s,
-                    detail: None,
-                },
-                Output::Rich { text, detail } => Entry {
-                    text,
-                    detail: Some(detail),
-                },
-            };
-            app.events.push(evt);
+            app.push_output(record);
         }
         if app.events.len() > HISTORY_CAP {
             let drop_n = app.events.len() - HISTORY_CAP;
             app.events.drain(..drop_n);
+            app.rebuild_visible();
         }
 
         // 5 (metrics) + 3 (footer) + 2 (log block borders) rows of chrome.
@@ -187,9 +252,9 @@ fn app_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Result
         // view, cap so the window stays full instead of stranding the last
         // event at the top with empty space below.
         let max_scroll = if app.wrap || app.rich {
-            app.events.len().saturating_sub(1)
+            app.visible.len().saturating_sub(1)
         } else {
-            app.events.len().saturating_sub(log_h)
+            app.visible.len().saturating_sub(log_h)
         };
         if app.follow {
             app.scroll = max_scroll;
@@ -234,8 +299,29 @@ fn app_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Result
 /// Handle one key. Returns `true` to quit.
 fn handle_key(app: &mut App, log_h: usize, key: KeyEvent) -> bool {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    if key.code == KeyCode::Char('c') && ctrl {
+        return true;
+    }
+    if app.filter_editing {
+        match key.code {
+            KeyCode::Esc => {
+                app.clear_filter();
+                app.filter_editing = false;
+            }
+            KeyCode::Enter if app.filter_error.is_none() => app.filter_editing = false,
+            KeyCode::Backspace => {
+                app.filter_text.pop();
+                app.update_filter();
+            }
+            KeyCode::Char(ch) if !ctrl => {
+                app.filter_text.push(ch);
+                app.update_filter();
+            }
+            _ => {}
+        }
+        return false;
+    }
     match key.code {
-        KeyCode::Char('c') if ctrl => return true,
         KeyCode::Char('q') => return true,
         KeyCode::Char('j') | KeyCode::Down => {
             app.follow = false;
@@ -261,7 +347,12 @@ fn handle_key(app: &mut App, log_h: usize, key: KeyEvent) -> bool {
         KeyCode::Char('f') => app.follow = !app.follow,
         KeyCode::Char('w') => app.wrap = !app.wrap,
         KeyCode::Char('r') => app.rich = !app.rich,
-        KeyCode::Char('c') => app.events.clear(),
+        KeyCode::Char('c') => {
+            app.events.clear();
+            app.visible.clear();
+        }
+        KeyCode::Char('/') => app.filter_editing = true,
+        KeyCode::Esc if !app.filter.is_empty() => app.clear_filter(),
         _ => {}
     }
     false
@@ -276,11 +367,20 @@ fn draw(frame: &mut Frame, app: &App, log_h: usize) {
     .areas(frame.area());
 
     // --- title bar: rich metrics header ---
-    let heading = format!(
-        " tapgres — {} mode · {} events ",
-        app.mode,
-        app.events.len()
-    );
+    let heading = if app.filter.is_empty() {
+        format!(
+            " tapgres — {} mode · {} events ",
+            app.mode,
+            app.events.len()
+        )
+    } else {
+        format!(
+            " tapgres — {} mode · {}/{} matching ",
+            app.mode,
+            app.visible.len(),
+            app.events.len()
+        )
+    };
     let metrics = app.metrics.summary();
     let current = metrics.rates.last().copied().unwrap_or_default();
 
@@ -393,9 +493,21 @@ fn draw(frame: &mut Frame, app: &App, log_h: usize) {
     );
 
     // --- message view ---
+    let filter_title = if app.filter_text.is_empty() {
+        " messages ".to_string()
+    } else {
+        format!(" messages · filter: {} ", app.filter_text)
+    };
+    let filter_color = if app.filter_error.is_some() {
+        Color::Red
+    } else if !app.filter.is_empty() {
+        Color::Yellow
+    } else {
+        Color::Green
+    };
     let log_block = Block::bordered()
-        .title_top(Line::raw(" messages "))
-        .border_style(Style::default().fg(Color::Green));
+        .title_top(Line::raw(filter_title))
+        .border_style(Style::default().fg(filter_color));
     let inner_w = log_area.width.saturating_sub(2) as usize;
     let view = View {
         rich: app.rich,
@@ -408,14 +520,22 @@ fn draw(frame: &mut Frame, app: &App, log_h: usize) {
     // they share the row-counted window; the plain one-row view stays on the
     // cheap fixed-slice path.
     let (start, end) = if app.wrap || app.rich {
-        view_window(&app.events, app.scroll, app.follow, log_h, inner_w, view)
+        view_window(
+            &app.events,
+            &app.visible,
+            app.scroll,
+            app.follow,
+            log_h,
+            inner_w,
+            view,
+        )
     } else {
         let s = app.scroll;
-        (s, (s + log_h).min(app.events.len()))
+        (s, (s + log_h).min(app.visible.len()))
     };
     let mut lines: Vec<Line> = Vec::new();
-    for evt in &app.events[start..end] {
-        lines.extend(event_lines(evt, view));
+    for &event_index in &app.visible[start..end] {
+        lines.extend(event_lines(&app.events[event_index], view));
     }
     let mut para = Paragraph::new(Text::from(lines)).block(log_block);
     if app.wrap {
@@ -426,16 +546,37 @@ fn draw(frame: &mut Frame, app: &App, log_h: usize) {
     // --- footer: follow/wrap/rich state shown by colour (green = on) ---
     let on = Style::default().fg(Color::Green);
     let off = Style::default();
-    let footer = Line::from(vec![
-        Span::raw(" q quit · j/k ↑↓ · PgUp/PgDn · g/G top/bottom · f "),
-        Span::styled("follow", if app.follow { on } else { off }),
-        Span::raw(" · w "),
-        Span::styled("wrap", if app.wrap { on } else { off }),
-        Span::raw(" · r "),
-        Span::styled("rich", if app.rich { on } else { off }),
-        Span::raw(" · c clear "),
-    ]);
-    frame.render_widget(Paragraph::new(footer).block(Block::bordered()), foot_area);
+    if app.filter_editing {
+        let style = if app.filter_error.is_some() {
+            Style::default().fg(Color::Red)
+        } else {
+            Style::default().fg(Color::Yellow)
+        };
+        let detail = app
+            .filter_error
+            .as_deref()
+            .map(|error| format!("  ⚠ {error}"))
+            .unwrap_or_default();
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(format!(" / {}█", app.filter_text), style),
+                Span::styled(detail, Style::default().fg(Color::Red)),
+            ]))
+            .block(Block::bordered().title_top(" filter · Enter done · Esc clear ")),
+            foot_area,
+        );
+    } else {
+        let footer = Line::from(vec![
+            Span::raw(" q quit · j/k ↑↓ · PgUp/PgDn · g/G top/bottom · f "),
+            Span::styled("follow", if app.follow { on } else { off }),
+            Span::raw(" · w "),
+            Span::styled("wrap", if app.wrap { on } else { off }),
+            Span::raw(" · r "),
+            Span::styled("rich", if app.rich { on } else { off }),
+            Span::raw(" · / filter · c clear "),
+        ]);
+        frame.render_widget(Paragraph::new(footer).block(Block::bordered()), foot_area);
+    }
 }
 
 fn human(value: u64) -> String {
@@ -494,22 +635,23 @@ fn stat_text(
 /// the multi-row rich tables — both key event height off [`event_height`] —
 /// so an item that spans several rows is never cut in half.
 fn view_window(
-    events: &[Entry],
+    events: &[Output],
+    visible: &[usize],
     scroll: usize,
     follow: bool,
     log_h: usize,
     width: usize,
     view: View,
 ) -> (usize, usize) {
-    let n = events.len();
+    let n = visible.len();
     if n == 0 {
         return (0, 0);
     }
     let mut rows = 0usize;
     if follow {
         let mut start = n;
-        for (i, evt) in events.iter().enumerate().rev() {
-            let h = event_height(evt, width, view);
+        for (i, &event_index) in visible.iter().enumerate().rev() {
+            let h = event_height(&events[event_index], width, view);
             if rows != 0 && rows + h > log_h {
                 break;
             }
@@ -522,8 +664,8 @@ fn view_window(
         (start, n)
     } else {
         let mut end = scroll;
-        for (i, evt) in events.iter().enumerate().skip(scroll) {
-            let h = event_height(evt, width, view);
+        for (i, &event_index) in visible.iter().enumerate().skip(scroll) {
+            let h = event_height(&events[event_index], width, view);
             if rows != 0 && rows + h > log_h {
                 break;
             }
@@ -541,7 +683,7 @@ fn view_window(
 /// wrapped height in wrap mode); a rich `DataRow`/`RowDescription` is one
 /// header row plus one row per column. In wrap mode any of those lines may
 /// further reflow, so defer to ratatui's `Paragraph::line_count`.
-fn event_height(evt: &Entry, width: usize, view: View) -> usize {
+fn event_height(evt: &Output, width: usize, view: View) -> usize {
     if view.wrap {
         return Paragraph::new(Text::from(event_lines(evt, view)))
             .wrap(Wrap { trim: false })
@@ -549,7 +691,7 @@ fn event_height(evt: &Entry, width: usize, view: View) -> usize {
             .max(1);
     }
     if view.rich {
-        match &evt.detail {
+        match evt.detail() {
             Some(decode::EventDetail::DataRow(cols)) => 1 + cols.len(),
             Some(decode::EventDetail::RowDescription(fields)) => 1 + fields.len(),
             None => 1,
@@ -562,13 +704,13 @@ fn event_height(evt: &Entry, width: usize, view: View) -> usize {
 /// The lines an event renders as: the flat line view, or — in rich mode, when
 /// structured detail is available — a header line followed by a key/value (or
 /// typed column) breakdown.
-fn event_lines<'a>(evt: &'a Entry, view: View) -> Vec<Line<'a>> {
+fn event_lines(evt: &Output, view: View) -> Vec<Line<'_>> {
     if view.rich {
-        if let Some(detail) = &evt.detail {
-            return render_rich(&evt.text, detail);
+        if let Some(detail) = evt.detail() {
+            return render_rich(evt.rendered(), detail);
         }
     }
-    vec![build_line(&evt.text)]
+    vec![build_line(evt.rendered())]
 }
 
 /// Render a structured event for rich mode: the kind header (no line-view
@@ -763,6 +905,7 @@ fn direction_split(line: &str) -> Option<(Color, usize, usize)> {
 mod tests {
     use super::*;
     use crate::decode::{DataColumn, EventDetail};
+    use crate::filter::{DisplayMessage, MessageDirection};
 
     fn data_row_detail(n: usize) -> EventDetail {
         EventDetail::DataRow(
@@ -778,6 +921,39 @@ mod tests {
 
     fn view(rich: bool) -> View {
         View { rich, wrap: false }
+    }
+
+    fn message_with_detail(
+        kind: &str,
+        text: &str,
+        port: u16,
+        detail: Option<EventDetail>,
+    ) -> Output {
+        Output::Message {
+            message: DisplayMessage {
+                rendered: format!("[{kind}] {text}"),
+                client: format!("127.0.0.1:{port}").parse().unwrap(),
+                direction: MessageDirection::FrontendToBackend,
+                kind: kind.into(),
+                text: text.into(),
+            },
+            detail,
+        }
+    }
+
+    fn message(kind: &str, text: &str, port: u16) -> Output {
+        message_with_detail(kind, text, port, None)
+    }
+
+    fn app() -> App {
+        let (_tx, rx) = crossbeam_channel::unbounded();
+        App::new(
+            rx,
+            "test",
+            Arc::new(Metrics::new()),
+            false,
+            DisplayFilter::default(),
+        )
     }
 
     #[test]
@@ -812,20 +988,14 @@ mod tests {
 
     #[test]
     fn event_height_counts_header_plus_each_field() {
-        let entry = Entry {
-            text: "x".into(),
-            detail: Some(data_row_detail(3)),
-        };
+        let entry = message_with_detail("DataRow", "x", 40005, Some(data_row_detail(3)));
         // 1 header row + 3 columns, non-wrap rich mode.
         assert_eq!(event_height(&entry, 80, view(true)), 4);
     }
 
     #[test]
     fn event_height_plain_line_is_one_row() {
-        let entry = Entry {
-            text: "x".into(),
-            detail: None,
-        };
+        let entry = message("Query", "x", 40005);
         assert_eq!(event_height(&entry, 80, view(false)), 1);
         // Rich mode with no structured detail still renders the flat line.
         assert_eq!(event_height(&entry, 80, view(true)), 1);
@@ -836,13 +1006,11 @@ mod tests {
         // Two rich DataRows, 3 columns each -> 4 rows each. A 5-row viewport in
         // follow mode must show only the last item fully (4 rows) rather than
         // start the first and clip it mid-table.
-        let events: Vec<Entry> = (0..2)
-            .map(|_| Entry {
-                text: "x".into(),
-                detail: Some(data_row_detail(3)),
-            })
+        let events: Vec<Output> = (0..2)
+            .map(|_| message_with_detail("DataRow", "x", 40005, Some(data_row_detail(3))))
             .collect();
-        let (start, end) = view_window(&events, 0, true, 5, 80, view(true));
+        let visible = vec![0, 1];
+        let (start, end) = view_window(&events, &visible, 0, true, 5, 80, view(true));
         assert_eq!((start, end), (1, 2));
     }
 
@@ -897,5 +1065,74 @@ mod tests {
             "int4 glyph should render: {body:?}"
         );
         assert!(body.contains("int4"), "type name should render: {body:?}");
+    }
+
+    #[test]
+    fn changing_filter_reapplies_to_retained_events() {
+        let mut app = app();
+        app.push_output(message("Query", "SELECT * FROM orders", 40005));
+        app.push_output(message("DataRow", "{ id=1 }", 40005));
+        app.push_output(message("Query", "SELECT * FROM users", 40006));
+        app.push_output(Output::Status("capture active".into()));
+        assert_eq!(app.events.len(), 4);
+        assert_eq!(app.visible, vec![0, 1, 2, 3]);
+
+        app.filter_text = "port=40005 type=Query keyword=orders".into();
+        app.update_filter();
+        assert_eq!(app.events.len(), 4);
+        assert_eq!(app.visible, vec![0, 3]);
+
+        app.clear_filter();
+        assert_eq!(app.events.len(), 4);
+        assert_eq!(app.visible, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn invalid_live_edit_preserves_last_valid_filter() {
+        let mut app = app();
+        app.push_output(message("Query", "SELECT 1", 40005));
+        app.push_output(message("DataRow", "{ id=1 }", 40005));
+
+        app.filter_text = "type=Query".into();
+        app.update_filter();
+        assert_eq!(app.visible, vec![0]);
+
+        app.filter_text = "type=Query unknown=value".into();
+        app.update_filter();
+        assert!(app.filter_error.is_some());
+        assert_eq!(app.visible, vec![0]);
+        assert_eq!(app.filter.expression(), "type=Query");
+    }
+
+    #[test]
+    fn slash_opens_editor_and_escape_clears_startup_filter() {
+        let (_tx, rx) = crossbeam_channel::unbounded();
+        let mut app = App::new(
+            rx,
+            "test",
+            Arc::new(Metrics::new()),
+            false,
+            DisplayFilter::parse("type=Query").unwrap(),
+        );
+        app.push_output(message("Query", "SELECT 1", 40005));
+        app.push_output(message("DataRow", "{ id=1 }", 40005));
+        assert_eq!(app.visible, vec![0]);
+
+        handle_key(
+            &mut app,
+            10,
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+        );
+        assert!(app.filter_editing);
+        handle_key(
+            &mut app,
+            10,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        );
+
+        assert!(!app.filter_editing);
+        assert!(app.filter.is_empty());
+        assert!(app.filter_text.is_empty());
+        assert_eq!(app.visible, vec![0, 1]);
     }
 }
