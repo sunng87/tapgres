@@ -55,12 +55,6 @@ struct Args {
     #[arg(long, default_value_t = false)]
     tui_rich: bool,
 
-    /// [tui] Disable icon-font (Nerd Font) type glyphs in rich mode, for
-    /// terminals whose font lacks the codepoints. Also off when
-    /// `TAPGRES_NO_GLYPHS` is set. Toggle at runtime with `i`.
-    #[arg(long, default_value_t = false)]
-    no_glyphs: bool,
-
     /// Maximum retained open + recently-closed connection records.
     /// Open connections are never evicted.
     #[arg(long, default_value_t = state::DEFAULT_CONNECTION_CAP)]
@@ -128,9 +122,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         args.conn_history,
         args.rate_history,
     ));
-    // Glyphs default on; turned off by --no-glyphs or the TAPGRES_NO_GLYPHS env
-    // var (for terminals whose font lacks the Nerd Font codepoints).
-    let glyphs = !(args.no_glyphs || std::env::var_os("TAPGRES_NO_GLYPHS").is_some());
     match args.mode {
         Mode::Pcap => {
             let opts = capture::PcapOpts {
@@ -140,7 +131,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 snaplen: args.snaplen,
             };
             if args.tui {
-                tui::run_pcap(opts, metrics, args.tui_rich, glyphs)
+                tui::run_pcap(opts, metrics, args.tui_rich)
             } else {
                 run_stdout(move || capture::run(opts, metrics))
             }
@@ -155,7 +146,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 no_upstream_tls: args.no_upstream_tls,
             };
             if args.tui {
-                tui::run_mitm(opts, metrics, args.tui_rich, glyphs)
+                tui::run_mitm(opts, metrics, args.tui_rich)
             } else {
                 run_stdout(move || proxy::run(opts, metrics))
             }

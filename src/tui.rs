@@ -38,7 +38,6 @@ pub fn run_pcap(
     opts: PcapOpts,
     metrics: Arc<Metrics>,
     rich: bool,
-    glyphs: bool,
 ) -> Result<(), Box<dyn Error>> {
     let source_metrics = metrics.clone();
     run(
@@ -50,7 +49,6 @@ pub fn run_pcap(
         "pcap",
         metrics,
         rich,
-        glyphs,
     )
 }
 
@@ -59,7 +57,6 @@ pub fn run_mitm(
     opts: ProxyOpts,
     metrics: Arc<Metrics>,
     rich: bool,
-    glyphs: bool,
 ) -> Result<(), Box<dyn Error>> {
     let source_metrics = metrics.clone();
     run(
@@ -81,7 +78,6 @@ pub fn run_mitm(
         "mitm",
         metrics,
         rich,
-        glyphs,
     )
 }
 
@@ -92,7 +88,6 @@ fn run(
     mode: &'static str,
     metrics: Arc<Metrics>,
     rich: bool,
-    glyphs: bool,
 ) -> Result<(), Box<dyn Error>> {
     // One channel: the source (background thread) produces via decode::out,
     // the TUI (this thread) consumes.
@@ -106,7 +101,7 @@ fn run(
     let _rate_sampler = metrics.spawn_rate_sampler()?;
 
     let mut terminal = ratatui::try_init()?;
-    let result = app_loop(&mut terminal, App::new(rx, mode, metrics, rich, glyphs));
+    let result = app_loop(&mut terminal, App::new(rx, mode, metrics, rich));
     // Restore the terminal even on error. try_init installs a panic hook that
     // also restores, so panics are covered too.
     let _ = ratatui::try_restore();
@@ -121,12 +116,11 @@ struct Entry {
 }
 
 /// Rich-mode rendering options bundled together so the draw/window functions
-/// stay readable as more toggles accumulate (#15: rich, glyphs, ...).
+/// stay readable as more toggles accumulate.
 #[derive(Clone, Copy)]
 struct View {
     rich: bool,
     wrap: bool,
-    glyphs: bool,
 }
 
 struct App {
@@ -139,11 +133,9 @@ struct App {
     /// Wrap long lines to the viewport width.
     wrap: bool,
     /// Rich display mode: draw `DataRow` as a per-message key/value table and
-    /// `RowDescription` as a typed column list, instead of the flat line.
+    /// `RowDescription` as a typed column list, instead of the flat line. Type
+    /// names are shown with an icon-font (Nerd Font) glyph.
     rich: bool,
-    /// Show icon-font (Nerd Font) type glyphs next to type names in rich mode.
-    /// Off when the terminal lacks a Nerd Font (`--no-glyphs` / `TAPGRES_NO_GLYPHS`).
-    glyphs: bool,
     mode: &'static str,
     metrics: Arc<Metrics>,
     /// All-time peak messages/sec seen this session, per direction. Used as a
@@ -154,13 +146,7 @@ struct App {
 }
 
 impl App {
-    fn new(
-        rx: Receiver<Output>,
-        mode: &'static str,
-        metrics: Arc<Metrics>,
-        rich: bool,
-        glyphs: bool,
-    ) -> Self {
+    fn new(rx: Receiver<Output>, mode: &'static str, metrics: Arc<Metrics>, rich: bool) -> Self {
         Self {
             rx,
             events: Vec::new(),
@@ -168,7 +154,6 @@ impl App {
             follow: true,
             wrap: false,
             rich,
-            glyphs,
             mode,
             metrics,
             peak_msgs_in: 0,
@@ -278,7 +263,6 @@ fn handle_key(app: &mut App, log_h: usize, key: KeyEvent) -> bool {
         KeyCode::Char('f') => app.follow = !app.follow,
         KeyCode::Char('w') => app.wrap = !app.wrap,
         KeyCode::Char('r') => app.rich = !app.rich,
-        KeyCode::Char('i') => app.glyphs = !app.glyphs,
         KeyCode::Char('c') => app.events.clear(),
         _ => {}
     }
@@ -418,7 +402,6 @@ fn draw(frame: &mut Frame, app: &App, log_h: usize) {
     let view = View {
         rich: app.rich,
         wrap: app.wrap,
-        glyphs: app.glyphs,
     };
     // Size the window by display rows so every shown item is fully visible (no
     // mid-item clipping): follow fills backward from the newest event, else
@@ -442,7 +425,7 @@ fn draw(frame: &mut Frame, app: &App, log_h: usize) {
     }
     frame.render_widget(para, log_area);
 
-    // --- footer: follow/wrap/rich/glyphs state shown by colour (green = on) ---
+    // --- footer: follow/wrap/rich state shown by colour (green = on) ---
     let on = Style::default().fg(Color::Green);
     let off = Style::default();
     let footer = Line::from(vec![
@@ -452,8 +435,6 @@ fn draw(frame: &mut Frame, app: &App, log_h: usize) {
         Span::styled("wrap", if app.wrap { on } else { off }),
         Span::raw(" · r "),
         Span::styled("rich", if app.rich { on } else { off }),
-        Span::raw(" · i "),
-        Span::styled("glyphs", if app.glyphs { on } else { off }),
         Span::raw(" · c clear "),
     ]);
     frame.render_widget(Paragraph::new(footer).block(Block::bordered()), foot_area);
@@ -586,7 +567,7 @@ fn event_height(evt: &Entry, width: usize, view: View) -> usize {
 fn event_lines<'a>(evt: &'a Entry, view: View) -> Vec<Line<'a>> {
     if view.rich {
         if let Some(detail) = &evt.detail {
-            return render_rich(&evt.text, detail, view);
+            return render_rich(&evt.text, detail);
         }
     }
     vec![build_line(&evt.text)]
@@ -598,7 +579,7 @@ fn event_lines<'a>(evt: &'a Entry, view: View) -> Vec<Line<'a>> {
 /// to read as a header and stay distinct from the cyan/magenta direction
 /// colours; each type is shown as an icon-font glyph (when enabled) plus its
 /// textual name.
-fn render_rich<'a>(text: &'a str, detail: &'a decode::EventDetail, view: View) -> Vec<Line<'a>> {
+fn render_rich<'a>(text: &'a str, detail: &'a decode::EventDetail) -> Vec<Line<'a>> {
     let key = Style::default().fg(Color::Blue).bold();
     // The structured rows below ARE the content, so the header carries only the
     // timestamp/direction/kind — not the line-view summary text, which would
@@ -614,7 +595,7 @@ fn render_rich<'a>(text: &'a str, detail: &'a decode::EventDetail, view: View) -
                     Span::raw(c.value.clone()),
                     Span::raw("  "),
                 ];
-                row.extend(type_spans(c.type_oid, view.glyphs));
+                row.extend(type_spans(c.type_oid));
                 lines.push(Line::from(row));
             }
         }
@@ -625,7 +606,7 @@ fn render_rich<'a>(text: &'a str, detail: &'a decode::EventDetail, view: View) -
                     Span::styled(f.name.clone(), key),
                     Span::raw("  "),
                 ];
-                row.extend(type_spans(f.type_oid, view.glyphs));
+                row.extend(type_spans(f.type_oid));
                 lines.push(Line::from(row));
             }
         }
@@ -665,9 +646,9 @@ fn type_label(oid: u32) -> String {
 
 /// Icon-font glyph for a column type, keyed on the PostgreSQL OID, plus a
 /// category colour. The codepoints are Font Awesome solid (preserved verbatim
-/// by Nerd Fonts v3): they render as icons on a Nerd Font and as tofu
-/// otherwise, which is why the textual [`type_label`] is always shown too and
-/// `--no-glyphs`/`i` exist to disable them. Returns `None` for unknown OIDs.
+/// by Nerd Fonts v3) and require a Nerd Font in the terminal; the textual
+/// [`type_label`] is always shown alongside, so the type is never ambiguous.
+/// Returns `None` for unknown OIDs, which then render with the name only.
 fn type_icon(oid: u32) -> Option<(char, Color)> {
     Some(match oid {
         16 => ('\u{f00c}', Color::Green), // bool -> check
@@ -683,15 +664,13 @@ fn type_icon(oid: u32) -> Option<(char, Color)> {
     })
 }
 
-/// Styled spans for a column's type: an icon-font glyph (when enabled and
-/// known) followed by the textual type name.
-fn type_spans(oid: u32, glyphs: bool) -> Vec<Span<'static>> {
+/// Styled spans for a column's type: an icon-font glyph (when known) followed
+/// by the textual type name. Rich mode always shows the glyph.
+fn type_spans(oid: u32) -> Vec<Span<'static>> {
     let mut spans = Vec::with_capacity(3);
-    if glyphs {
-        if let Some((g, color)) = type_icon(oid) {
-            spans.push(Span::styled(g.to_string(), Style::default().fg(color)));
-            spans.push(Span::raw(" "));
-        }
+    if let Some((g, color)) = type_icon(oid) {
+        spans.push(Span::styled(g.to_string(), Style::default().fg(color)));
+        spans.push(Span::raw(" "));
     }
     spans.push(Span::styled(
         type_label(oid),
@@ -795,11 +774,10 @@ mod tests {
         )
     }
 
-    fn view(rich: bool, glyphs: bool) -> View {
+    fn view(rich: bool) -> View {
         View {
             rich,
             wrap: false,
-            glyphs,
         }
     }
 
@@ -821,17 +799,14 @@ mod tests {
     }
 
     #[test]
-    fn type_spans_omit_glyph_when_disabled_or_unknown() {
-        // Glyph present when enabled and known.
-        let on = type_spans(23, true);
-        assert_eq!(on.len(), 3); // glyph, space, label
-        assert_eq!(on[2].content.as_ref(), "int4");
-        // Disabled -> name only, no glyph.
-        let off = type_spans(23, false);
-        assert_eq!(off.len(), 1);
-        assert_eq!(off[0].content.as_ref(), "int4");
-        // Unknown OID -> name only even with glyphs on.
-        let unknown = type_spans(9999, true);
+    fn type_spans_render_glyph_for_known_and_name_only_for_unknown() {
+        // Known OID -> glyph + space + label.
+        let known = type_spans(23);
+        assert_eq!(known.len(), 3);
+        assert_eq!(known[0].content.as_ref(), "\u{f292}");
+        assert_eq!(known[2].content.as_ref(), "int4");
+        // Unknown OID -> name only, no glyph.
+        let unknown = type_spans(9999);
         assert_eq!(unknown.len(), 1);
         assert_eq!(unknown[0].content.as_ref(), "oid=9999");
     }
@@ -843,15 +818,15 @@ mod tests {
             detail: Some(data_row_detail(3)),
         };
         // 1 header row + 3 columns, non-wrap rich mode.
-        assert_eq!(event_height(&entry, 80, view(true, false)), 4);
+        assert_eq!(event_height(&entry, 80, view(true)), 4);
     }
 
     #[test]
     fn event_height_plain_line_is_one_row() {
         let entry = Entry { text: "x".into(), detail: None };
-        assert_eq!(event_height(&entry, 80, view(false, false)), 1);
+        assert_eq!(event_height(&entry, 80, view(false)), 1);
         // Rich mode with no structured detail still renders the flat line.
-        assert_eq!(event_height(&entry, 80, view(true, false)), 1);
+        assert_eq!(event_height(&entry, 80, view(true)), 1);
     }
 
     #[test]
@@ -865,7 +840,7 @@ mod tests {
                 detail: Some(data_row_detail(3)),
             })
             .collect();
-        let (start, end) = view_window(&events, 0, true, 5, 80, view(true, false));
+        let (start, end) = view_window(&events, 0, true, 5, 80, view(true));
         assert_eq!((start, end), (1, 2));
     }
 
@@ -879,7 +854,7 @@ mod tests {
             type_oid: 25,
             value: "'alice'".into(),
         }]);
-        let rendered = render_rich(text, &detail, view(true, false));
+        let rendered = render_rich(text, &detail);
         let header: String = rendered[0].spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(header.contains("DataRow"), "header: {header}");
         assert!(
@@ -891,23 +866,17 @@ mod tests {
     }
 
     #[test]
-    fn rich_type_row_carries_glyph_only_when_enabled() {
-        // Same DataRow rendered with glyphs on vs off: the glyph codepoint is
-        // present only when glyphs are on (the type name is there either way).
+    fn rich_type_row_carries_glyph_and_name() {
+        // Rich mode always renders the glyph (nerd font assumed) plus the name.
         let text = "[00:00:00.000] [B→F] DataRow";
         let detail = EventDetail::DataRow(vec![DataColumn {
             name: "id".into(),
             type_oid: 23,
             value: "1".into(),
         }]);
-        let body_on: String = render_rich(text, &detail, view(true, true))[1]
+        let body: String = render_rich(text, &detail)[1]
             .spans.iter().map(|s| s.content.as_ref()).collect();
-        let body_off: String = render_rich(text, &detail, view(true, false))[1]
-            .spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(body_on.contains('\u{f292}'), "glyph should render when on: {body_on:?}");
-        assert!(!body_off.contains('\u{f292}'), "glyph must be absent when off: {body_off:?}");
-        // Type name present in both.
-        assert!(body_on.contains("int4"));
-        assert!(body_off.contains("int4"));
+        assert!(body.contains('\u{f292}'), "int4 glyph should render: {body:?}");
+        assert!(body.contains("int4"), "type name should render: {body:?}");
     }
 }
