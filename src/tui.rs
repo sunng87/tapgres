@@ -34,11 +34,7 @@ use crate::state::Metrics;
 const HISTORY_CAP: usize = 50_000;
 
 /// TUI over the passive pcap capture.
-pub fn run_pcap(
-    opts: PcapOpts,
-    metrics: Arc<Metrics>,
-    rich: bool,
-) -> Result<(), Box<dyn Error>> {
+pub fn run_pcap(opts: PcapOpts, metrics: Arc<Metrics>, rich: bool) -> Result<(), Box<dyn Error>> {
     let source_metrics = metrics.clone();
     run(
         Box::new(move || {
@@ -53,11 +49,7 @@ pub fn run_pcap(
 }
 
 /// TUI over the TLS-terminating mitm proxy.
-pub fn run_mitm(
-    opts: ProxyOpts,
-    metrics: Arc<Metrics>,
-    rich: bool,
-) -> Result<(), Box<dyn Error>> {
+pub fn run_mitm(opts: ProxyOpts, metrics: Arc<Metrics>, rich: bool) -> Result<(), Box<dyn Error>> {
     let source_metrics = metrics.clone();
     run(
         Box::new(move || {
@@ -166,8 +158,14 @@ fn app_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Result
     loop {
         while let Ok(record) = app.rx.try_recv() {
             let evt = match record {
-                Output::Line(s) | Output::Status(s) => Entry { text: s, detail: None },
-                Output::Rich { text, detail } => Entry { text, detail: Some(detail) },
+                Output::Line(s) | Output::Status(s) => Entry {
+                    text: s,
+                    detail: None,
+                },
+                Output::Rich { text, detail } => Entry {
+                    text,
+                    detail: Some(detail),
+                },
             };
             app.events.push(evt);
         }
@@ -651,14 +649,14 @@ fn type_label(oid: u32) -> String {
 /// Returns `None` for unknown OIDs, which then render with the name only.
 fn type_icon(oid: u32) -> Option<(char, Color)> {
     Some(match oid {
-        16 => ('\u{f00c}', Color::Green), // bool -> check
-        20 | 21 | 23 => ('\u{f292}', Color::Yellow), // int8/int2/int4 -> hashtag
+        16 => ('\u{f00c}', Color::Green),                // bool -> check
+        20 | 21 | 23 => ('\u{f292}', Color::Yellow),     // int8/int2/int4 -> hashtag
         700 | 701 | 1700 => ('\u{f1ec}', Color::Yellow), // float4/float8/numeric -> calculator
         18 | 19 | 25 | 1042 | 1043 => ('\u{f031}', Color::Cyan), // char/name/text/bpchar/varchar -> font
-        114 | 3802 => ('\u{f121}', Color::Magenta), // json/jsonb -> code
-        2950 => ('\u{f577}', Color::Magenta), // uuid -> fingerprint
-        17 => ('\u{f1c0}', Color::Green), // bytea -> database
-        1082 => ('\u{f073}', Color::Cyan), // date -> calendar
+        114 | 3802 => ('\u{f121}', Color::Magenta),              // json/jsonb -> code
+        2950 => ('\u{f577}', Color::Magenta),                    // uuid -> fingerprint
+        17 => ('\u{f1c0}', Color::Green),                        // bytea -> database
+        1082 => ('\u{f073}', Color::Cyan),                       // date -> calendar
         1083 | 1114 | 1184 | 1186 | 1266 => ('\u{f017}', Color::Cyan), // time/timestamp*/interval -> clock
         _ => return None,
     })
@@ -697,7 +695,9 @@ fn build_line(line: &str) -> Line<'_> {
         Span::raw(&line[..p.prefix_end]).fg(Color::DarkGray),
         Span::raw(&line[p.prefix_end..p.tag_end]).fg(p.color).bold(),
         Span::raw(&line[p.tag_end..p.kind_start]),
-        Span::raw(&line[p.kind_start..p.kind_end]).fg(p.color).bold(),
+        Span::raw(&line[p.kind_start..p.kind_end])
+            .fg(p.color)
+            .bold(),
         Span::raw(&line[p.kind_end..]),
     ])
 }
@@ -713,7 +713,9 @@ fn build_header_line(line: &str) -> Line<'_> {
         Span::raw(&line[..p.prefix_end]).fg(Color::DarkGray),
         Span::raw(&line[p.prefix_end..p.tag_end]).fg(p.color).bold(),
         Span::raw(&line[p.tag_end..p.kind_start]),
-        Span::raw(&line[p.kind_start..p.kind_end]).fg(p.color).bold(),
+        Span::raw(&line[p.kind_start..p.kind_end])
+            .fg(p.color)
+            .bold(),
     ])
 }
 
@@ -775,10 +777,7 @@ mod tests {
     }
 
     fn view(rich: bool) -> View {
-        View {
-            rich,
-            wrap: false,
-        }
+        View { rich, wrap: false }
     }
 
     #[test]
@@ -823,7 +822,10 @@ mod tests {
 
     #[test]
     fn event_height_plain_line_is_one_row() {
-        let entry = Entry { text: "x".into(), detail: None };
+        let entry = Entry {
+            text: "x".into(),
+            detail: None,
+        };
         assert_eq!(event_height(&entry, 80, view(false)), 1);
         // Rich mode with no structured detail still renders the flat line.
         assert_eq!(event_height(&entry, 80, view(true)), 1);
@@ -855,14 +857,25 @@ mod tests {
             value: "'alice'".into(),
         }]);
         let rendered = render_rich(text, &detail);
-        let header: String = rendered[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        let header: String = rendered[0]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
         assert!(header.contains("DataRow"), "header: {header}");
         assert!(
             !header.contains("alice"),
             "header must not repeat row content: {header}"
         );
-        let body: String = rendered[1].spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(body.contains("alice"), "body should carry the value: {body}");
+        let body: String = rendered[1]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(
+            body.contains("alice"),
+            "body should carry the value: {body}"
+        );
     }
 
     #[test]
@@ -875,8 +888,14 @@ mod tests {
             value: "1".into(),
         }]);
         let body: String = render_rich(text, &detail)[1]
-            .spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(body.contains('\u{f292}'), "int4 glyph should render: {body:?}");
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(
+            body.contains('\u{f292}'),
+            "int4 glyph should render: {body:?}"
+        );
         assert!(body.contains("int4"), "type name should render: {body:?}");
     }
 }

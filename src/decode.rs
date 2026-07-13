@@ -458,7 +458,12 @@ fn handle_backend(
             let columns = data_row_columns(&r, desc);
             let text = format_columns(&columns, desc.is_some());
             if desc.is_some() {
-                emit_rich(Role::Server, "DataRow", &text, EventDetail::DataRow(columns));
+                emit_rich(
+                    Role::Server,
+                    "DataRow",
+                    &text,
+                    EventDetail::DataRow(columns),
+                );
             } else {
                 // No cached description -> nothing to key a table on; emit the
                 // flat line view only.
