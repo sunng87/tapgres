@@ -20,8 +20,15 @@ prepare() {
   cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
 }
 
+# `ring` (pulled in by rustls/tokio-rustls) compiles C and assembly via its
+# build script using the `cc` crate, which inherits CFLAGS/CXXFLAGS/CC from the
+# environment. makepkg exports the system hardening flags *and* the user's
+# toolchain (e.g. CC=clang) from /etc/makepkg.conf, and that combination can
+# break ring's native code (undefined reference to `adx_bmi2_available`).
+# Drop them so ring builds with the same clean toolchain as `cargo build`.
 build() {
   cd "$pkgname-$pkgver"
+  unset CC CXX CFLAGS CXXFLAGS LDFLAGS RUSTFLAGS
   cargo build --frozen --release
 }
 
