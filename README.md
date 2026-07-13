@@ -106,6 +106,7 @@ Keybindings:
 | `f` | toggle follow (auto-tail) |
 | `w` | toggle line wrap |
 | `r` | toggle rich display mode |
+| `i` | toggle icon-font type glyphs (rich mode) |
 | `c` | clear |
 
 **Rich display mode** (`r`, or `--tui-rich` at startup) renders structured
@@ -114,6 +115,13 @@ per-message key/value table (`column = value`, with its type), and a
 `RowDescription` becomes a typed column list. Column names/types come from the
 connection's cached `RowDescription`, so the rich view is keyed on real field
 names. The flat line view (the default) is unchanged.
+
+In rich mode each type is shown as an **icon-font glyph** plus its name
+(`# int4`, `A text`, `✓ bool`, …), keyed on the PostgreSQL OID. The glyphs use
+[Nerd Font](https://www.nerdfonts.com/) codepoints, so install a Nerd Font in
+your terminal to see them; the textual type name is always shown alongside, so
+nothing is hidden if a glyph is missing. Disable the glyphs with `i`, or start
+with `--no-glyphs` (or set `TAPGRES_NO_GLYPHS`).
 
 The direction symbol is highlighted in a high-contrast colour (`[F→B]` cyan,
 `[B→F]` magenta) and the message name is bold; warnings are red and connection

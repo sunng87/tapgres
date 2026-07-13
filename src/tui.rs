@@ -34,7 +34,12 @@ use crate::state::Metrics;
 const HISTORY_CAP: usize = 50_000;
 
 /// TUI over the passive pcap capture.
-pub fn run_pcap(opts: PcapOpts, metrics: Arc<Metrics>, rich: bool) -> Result<(), Box<dyn Error>> {
+pub fn run_pcap(
+    opts: PcapOpts,
+    metrics: Arc<Metrics>,
+    rich: bool,
+    glyphs: bool,
+) -> Result<(), Box<dyn Error>> {
     let source_metrics = metrics.clone();
     run(
         Box::new(move || {
@@ -45,11 +50,17 @@ pub fn run_pcap(opts: PcapOpts, metrics: Arc<Metrics>, rich: bool) -> Result<(),
         "pcap",
         metrics,
         rich,
+        glyphs,
     )
 }
 
 /// TUI over the TLS-terminating mitm proxy.
-pub fn run_mitm(opts: ProxyOpts, metrics: Arc<Metrics>, rich: bool) -> Result<(), Box<dyn Error>> {
+pub fn run_mitm(
+    opts: ProxyOpts,
+    metrics: Arc<Metrics>,
+    rich: bool,
+    glyphs: bool,
+) -> Result<(), Box<dyn Error>> {
     let source_metrics = metrics.clone();
     run(
         Box::new(move || {
@@ -70,6 +81,7 @@ pub fn run_mitm(opts: ProxyOpts, metrics: Arc<Metrics>, rich: bool) -> Result<()
         "mitm",
         metrics,
         rich,
+        glyphs,
     )
 }
 
@@ -80,6 +92,7 @@ fn run(
     mode: &'static str,
     metrics: Arc<Metrics>,
     rich: bool,
+    glyphs: bool,
 ) -> Result<(), Box<dyn Error>> {
     // One channel: the source (background thread) produces via decode::out,
     // the TUI (this thread) consumes.
@@ -93,7 +106,7 @@ fn run(
     let _rate_sampler = metrics.spawn_rate_sampler()?;
 
     let mut terminal = ratatui::try_init()?;
-    let result = app_loop(&mut terminal, App::new(rx, mode, metrics, rich));
+    let result = app_loop(&mut terminal, App::new(rx, mode, metrics, rich, glyphs));
     // Restore the terminal even on error. try_init installs a panic hook that
     // also restores, so panics are covered too.
     let _ = ratatui::try_restore();
@@ -105,6 +118,15 @@ fn run(
 struct Entry {
     text: String,
     detail: Option<decode::EventDetail>,
+}
+
+/// Rich-mode rendering options bundled together so the draw/window functions
+/// stay readable as more toggles accumulate (#15: rich, glyphs, ...).
+#[derive(Clone, Copy)]
+struct View {
+    rich: bool,
+    wrap: bool,
+    glyphs: bool,
 }
 
 struct App {
@@ -119,6 +141,9 @@ struct App {
     /// Rich display mode: draw `DataRow` as a per-message key/value table and
     /// `RowDescription` as a typed column list, instead of the flat line.
     rich: bool,
+    /// Show icon-font (Nerd Font) type glyphs next to type names in rich mode.
+    /// Off when the terminal lacks a Nerd Font (`--no-glyphs` / `TAPGRES_NO_GLYPHS`).
+    glyphs: bool,
     mode: &'static str,
     metrics: Arc<Metrics>,
     /// All-time peak messages/sec seen this session, per direction. Used as a
@@ -134,6 +159,7 @@ impl App {
         mode: &'static str,
         metrics: Arc<Metrics>,
         rich: bool,
+        glyphs: bool,
     ) -> Self {
         Self {
             rx,
@@ -142,6 +168,7 @@ impl App {
             follow: true,
             wrap: false,
             rich,
+            glyphs,
             mode,
             metrics,
             peak_msgs_in: 0,
@@ -251,6 +278,7 @@ fn handle_key(app: &mut App, log_h: usize, key: KeyEvent) -> bool {
         KeyCode::Char('f') => app.follow = !app.follow,
         KeyCode::Char('w') => app.wrap = !app.wrap,
         KeyCode::Char('r') => app.rich = !app.rich,
+        KeyCode::Char('i') => app.glyphs = !app.glyphs,
         KeyCode::Char('c') => app.events.clear(),
         _ => {}
     }
@@ -387,6 +415,11 @@ fn draw(frame: &mut Frame, app: &App, log_h: usize) {
         .title_top(Line::raw(" messages "))
         .border_style(Style::default().fg(Color::Green));
     let inner_w = log_area.width.saturating_sub(2) as usize;
+    let view = View {
+        rich: app.rich,
+        wrap: app.wrap,
+        glyphs: app.glyphs,
+    };
     // Size the window by display rows so every shown item is fully visible (no
     // mid-item clipping): follow fills backward from the newest event, else
     // forward from the scroll anchor. Wrap mode and rich mode both need this —
@@ -394,22 +427,14 @@ fn draw(frame: &mut Frame, app: &App, log_h: usize) {
     // they share the row-counted window; the plain one-row view stays on the
     // cheap fixed-slice path.
     let (start, end) = if app.wrap || app.rich {
-        view_window(
-            &app.events,
-            app.scroll,
-            app.follow,
-            log_h,
-            inner_w,
-            app.rich,
-            app.wrap,
-        )
+        view_window(&app.events, app.scroll, app.follow, log_h, inner_w, view)
     } else {
         let s = app.scroll;
         (s, (s + log_h).min(app.events.len()))
     };
     let mut lines: Vec<Line> = Vec::new();
     for evt in &app.events[start..end] {
-        lines.extend(event_lines(evt, app.rich));
+        lines.extend(event_lines(evt, view));
     }
     let mut para = Paragraph::new(Text::from(lines)).block(log_block);
     if app.wrap {
@@ -417,7 +442,7 @@ fn draw(frame: &mut Frame, app: &App, log_h: usize) {
     }
     frame.render_widget(para, log_area);
 
-    // --- footer: follow/wrap/rich state shown by colour (green = on) ---
+    // --- footer: follow/wrap/rich/glyphs state shown by colour (green = on) ---
     let on = Style::default().fg(Color::Green);
     let off = Style::default();
     let footer = Line::from(vec![
@@ -427,6 +452,8 @@ fn draw(frame: &mut Frame, app: &App, log_h: usize) {
         Span::styled("wrap", if app.wrap { on } else { off }),
         Span::raw(" · r "),
         Span::styled("rich", if app.rich { on } else { off }),
+        Span::raw(" · i "),
+        Span::styled("glyphs", if app.glyphs { on } else { off }),
         Span::raw(" · c clear "),
     ]);
     frame.render_widget(Paragraph::new(footer).block(Block::bordered()), foot_area);
@@ -493,8 +520,7 @@ fn view_window(
     follow: bool,
     log_h: usize,
     width: usize,
-    rich: bool,
-    wrap: bool,
+    view: View,
 ) -> (usize, usize) {
     let n = events.len();
     if n == 0 {
@@ -504,7 +530,7 @@ fn view_window(
     if follow {
         let mut start = n;
         for (i, evt) in events.iter().enumerate().rev() {
-            let h = event_height(evt, width, rich, wrap);
+            let h = event_height(evt, width, view);
             if rows != 0 && rows + h > log_h {
                 break;
             }
@@ -518,7 +544,7 @@ fn view_window(
     } else {
         let mut end = scroll;
         for (i, evt) in events.iter().enumerate().skip(scroll) {
-            let h = event_height(evt, width, rich, wrap);
+            let h = event_height(evt, width, view);
             if rows != 0 && rows + h > log_h {
                 break;
             }
@@ -536,14 +562,14 @@ fn view_window(
 /// wrapped height in wrap mode); a rich `DataRow`/`RowDescription` is one
 /// header row plus one row per column. In wrap mode any of those lines may
 /// further reflow, so defer to ratatui's `Paragraph::line_count`.
-fn event_height(evt: &Entry, width: usize, rich: bool, wrap: bool) -> usize {
-    if wrap {
-        return Paragraph::new(Text::from(event_lines(evt, rich)))
+fn event_height(evt: &Entry, width: usize, view: View) -> usize {
+    if view.wrap {
+        return Paragraph::new(Text::from(event_lines(evt, view)))
             .wrap(Wrap { trim: false })
             .line_count(width as u16)
             .max(1);
     }
-    if rich {
+    if view.rich {
         match &evt.detail {
             Some(decode::EventDetail::DataRow(cols)) => 1 + cols.len(),
             Some(decode::EventDetail::RowDescription(fields)) => 1 + fields.len(),
@@ -557,24 +583,23 @@ fn event_height(evt: &Entry, width: usize, rich: bool, wrap: bool) -> usize {
 /// The lines an event renders as: the flat line view, or — in rich mode, when
 /// structured detail is available — a header line followed by a key/value (or
 /// typed column) breakdown.
-fn event_lines<'a>(evt: &'a Entry, rich: bool) -> Vec<Line<'a>> {
-    if rich {
+fn event_lines<'a>(evt: &'a Entry, view: View) -> Vec<Line<'a>> {
+    if view.rich {
         if let Some(detail) = &evt.detail {
-            return render_rich(&evt.text, detail);
+            return render_rich(&evt.text, detail, view);
         }
     }
     vec![build_line(&evt.text)]
 }
 
-/// Render a structured event for rich mode: the normal prefix line, then one
-/// row per field. A `DataRow` becomes a `name = value` list; a
-/// `RowDescription` becomes a `name  type` list. Field names reuse the cyan
-/// direction colour so the key column reads like a header.
-fn render_rich<'a>(text: &'a str, detail: &'a decode::EventDetail) -> Vec<Line<'a>> {
-    // Yellow for field names so the key column reads as a header and stays
-    // distinct from the cyan/magenta direction colours used elsewhere.
-    let key = Style::default().fg(Color::Yellow).bold();
-    let dim = Style::default().fg(Color::DarkGray);
+/// Render a structured event for rich mode: the kind header (no line-view
+/// content), then one row per field. A `DataRow` becomes a `name = value`
+/// list; a `RowDescription` becomes a `name  type` list. Field names are blue
+/// to read as a header and stay distinct from the cyan/magenta direction
+/// colours; each type is shown as an icon-font glyph (when enabled) plus its
+/// textual name.
+fn render_rich<'a>(text: &'a str, detail: &'a decode::EventDetail, view: View) -> Vec<Line<'a>> {
+    let key = Style::default().fg(Color::Blue).bold();
     // The structured rows below ARE the content, so the header carries only the
     // timestamp/direction/kind — not the line-view summary text, which would
     // just duplicate the table.
@@ -582,23 +607,26 @@ fn render_rich<'a>(text: &'a str, detail: &'a decode::EventDetail) -> Vec<Line<'
     match detail {
         decode::EventDetail::DataRow(cols) => {
             for c in cols {
-                lines.push(Line::from(vec![
+                let mut row: Vec<Span<'static>> = vec![
                     Span::raw("   "),
                     Span::styled(c.name.clone(), key),
                     Span::raw(" = "),
                     Span::raw(c.value.clone()),
-                    Span::styled(format!("  {}", type_label(c.type_oid)), dim),
-                ]));
+                    Span::raw("  "),
+                ];
+                row.extend(type_spans(c.type_oid, view.glyphs));
+                lines.push(Line::from(row));
             }
         }
         decode::EventDetail::RowDescription(fields) => {
             for f in fields {
-                lines.push(Line::from(vec![
+                let mut row: Vec<Span<'static>> = vec![
                     Span::raw("   "),
                     Span::styled(f.name.clone(), key),
                     Span::raw("  "),
-                    Span::styled(type_label(f.type_oid), Style::default().fg(Color::Gray)),
-                ]));
+                ];
+                row.extend(type_spans(f.type_oid, view.glyphs));
+                lines.push(Line::from(row));
             }
         }
     }
@@ -607,8 +635,8 @@ fn render_rich<'a>(text: &'a str, detail: &'a decode::EventDetail) -> Vec<Line<'
 
 /// Human-friendly type name for common PostgreSQL OIDs, falling back to the
 /// numeric OID. This is the safe textual fallback issue #15 asks for — no
-/// glyph/font assumptions — and is the place glyphs will slot in behind a
-/// `--no-glyphs`/env flag later.
+/// glyph/font assumptions — and is always shown alongside any glyph so a
+/// terminal without the Nerd Font never loses the type.
 fn type_label(oid: u32) -> String {
     let name = match oid {
         16 => "bool",
@@ -633,6 +661,43 @@ fn type_label(oid: u32) -> String {
         _ => return format!("oid={oid}"),
     };
     name.to_string()
+}
+
+/// Icon-font glyph for a column type, keyed on the PostgreSQL OID, plus a
+/// category colour. The codepoints are Font Awesome solid (preserved verbatim
+/// by Nerd Fonts v3): they render as icons on a Nerd Font and as tofu
+/// otherwise, which is why the textual [`type_label`] is always shown too and
+/// `--no-glyphs`/`i` exist to disable them. Returns `None` for unknown OIDs.
+fn type_icon(oid: u32) -> Option<(char, Color)> {
+    Some(match oid {
+        16 => ('\u{f00c}', Color::Green), // bool -> check
+        20 | 21 | 23 => ('\u{f292}', Color::Yellow), // int8/int2/int4 -> hashtag
+        700 | 701 | 1700 => ('\u{f1ec}', Color::Yellow), // float4/float8/numeric -> calculator
+        18 | 19 | 25 | 1042 | 1043 => ('\u{f031}', Color::Cyan), // char/name/text/bpchar/varchar -> font
+        114 | 3802 => ('\u{f121}', Color::Magenta), // json/jsonb -> code
+        2950 => ('\u{f577}', Color::Magenta), // uuid -> fingerprint
+        17 => ('\u{f1c0}', Color::Green), // bytea -> database
+        1082 => ('\u{f073}', Color::Cyan), // date -> calendar
+        1083 | 1114 | 1184 | 1186 | 1266 => ('\u{f017}', Color::Cyan), // time/timestamp*/interval -> clock
+        _ => return None,
+    })
+}
+
+/// Styled spans for a column's type: an icon-font glyph (when enabled and
+/// known) followed by the textual type name.
+fn type_spans(oid: u32, glyphs: bool) -> Vec<Span<'static>> {
+    let mut spans = Vec::with_capacity(3);
+    if glyphs {
+        if let Some((g, color)) = type_icon(oid) {
+            spans.push(Span::styled(g.to_string(), Style::default().fg(color)));
+            spans.push(Span::raw(" "));
+        }
+    }
+    spans.push(Span::styled(
+        type_label(oid),
+        Style::default().fg(Color::DarkGray),
+    ));
+    spans
 }
 
 /// Render a line with the direction symbol (`[F→B]`/`[B→F]`) highlighted in a
@@ -730,6 +795,14 @@ mod tests {
         )
     }
 
+    fn view(rich: bool, glyphs: bool) -> View {
+        View {
+            rich,
+            wrap: false,
+            glyphs,
+        }
+    }
+
     #[test]
     fn type_label_maps_common_oids_and_falls_back() {
         assert_eq!(type_label(23), "int4");
@@ -739,21 +812,46 @@ mod tests {
     }
 
     #[test]
+    fn type_icon_maps_common_oids_and_none_for_unknown() {
+        // Known OIDs yield a glyph; the textual name stays authoritative.
+        assert_eq!(type_icon(16).map(|(c, _)| c), Some('\u{f00c}')); // bool
+        assert_eq!(type_icon(23).map(|(c, _)| c), Some('\u{f292}')); // int4
+        assert_eq!(type_icon(25).map(|(c, _)| c), Some('\u{f031}')); // text
+        assert!(type_icon(9999).is_none());
+    }
+
+    #[test]
+    fn type_spans_omit_glyph_when_disabled_or_unknown() {
+        // Glyph present when enabled and known.
+        let on = type_spans(23, true);
+        assert_eq!(on.len(), 3); // glyph, space, label
+        assert_eq!(on[2].content.as_ref(), "int4");
+        // Disabled -> name only, no glyph.
+        let off = type_spans(23, false);
+        assert_eq!(off.len(), 1);
+        assert_eq!(off[0].content.as_ref(), "int4");
+        // Unknown OID -> name only even with glyphs on.
+        let unknown = type_spans(9999, true);
+        assert_eq!(unknown.len(), 1);
+        assert_eq!(unknown[0].content.as_ref(), "oid=9999");
+    }
+
+    #[test]
     fn event_height_counts_header_plus_each_field() {
         let entry = Entry {
             text: "x".into(),
             detail: Some(data_row_detail(3)),
         };
         // 1 header row + 3 columns, non-wrap rich mode.
-        assert_eq!(event_height(&entry, 80, true, false), 4);
+        assert_eq!(event_height(&entry, 80, view(true, false)), 4);
     }
 
     #[test]
     fn event_height_plain_line_is_one_row() {
         let entry = Entry { text: "x".into(), detail: None };
-        assert_eq!(event_height(&entry, 80, false, false), 1);
+        assert_eq!(event_height(&entry, 80, view(false, false)), 1);
         // Rich mode with no structured detail still renders the flat line.
-        assert_eq!(event_height(&entry, 80, true, false), 1);
+        assert_eq!(event_height(&entry, 80, view(true, false)), 1);
     }
 
     #[test]
@@ -767,7 +865,7 @@ mod tests {
                 detail: Some(data_row_detail(3)),
             })
             .collect();
-        let (start, end) = view_window(&events, 0, true, 5, 80, true, false);
+        let (start, end) = view_window(&events, 0, true, 5, 80, view(true, false));
         assert_eq!((start, end), (1, 2));
     }
 
@@ -781,7 +879,7 @@ mod tests {
             type_oid: 25,
             value: "'alice'".into(),
         }]);
-        let rendered = render_rich(text, &detail);
+        let rendered = render_rich(text, &detail, view(true, false));
         let header: String = rendered[0].spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(header.contains("DataRow"), "header: {header}");
         assert!(
@@ -790,5 +888,26 @@ mod tests {
         );
         let body: String = rendered[1].spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(body.contains("alice"), "body should carry the value: {body}");
+    }
+
+    #[test]
+    fn rich_type_row_carries_glyph_only_when_enabled() {
+        // Same DataRow rendered with glyphs on vs off: the glyph codepoint is
+        // present only when glyphs are on (the type name is there either way).
+        let text = "[00:00:00.000] [B→F] DataRow";
+        let detail = EventDetail::DataRow(vec![DataColumn {
+            name: "id".into(),
+            type_oid: 23,
+            value: "1".into(),
+        }]);
+        let body_on: String = render_rich(text, &detail, view(true, true))[1]
+            .spans.iter().map(|s| s.content.as_ref()).collect();
+        let body_off: String = render_rich(text, &detail, view(true, false))[1]
+            .spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(body_on.contains('\u{f292}'), "glyph should render when on: {body_on:?}");
+        assert!(!body_off.contains('\u{f292}'), "glyph must be absent when off: {body_off:?}");
+        // Type name present in both.
+        assert!(body_on.contains("int4"));
+        assert!(body_off.contains("int4"));
     }
 }
