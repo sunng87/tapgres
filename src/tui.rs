@@ -34,7 +34,7 @@ use crate::state::Metrics;
 const HISTORY_CAP: usize = 50_000;
 
 /// TUI over the passive pcap capture.
-pub fn run_pcap(opts: PcapOpts, metrics: Arc<Metrics>) -> Result<(), Box<dyn Error>> {
+pub fn run_pcap(opts: PcapOpts, metrics: Arc<Metrics>, rich: bool) -> Result<(), Box<dyn Error>> {
     let source_metrics = metrics.clone();
     run(
         Box::new(move || {
@@ -44,11 +44,12 @@ pub fn run_pcap(opts: PcapOpts, metrics: Arc<Metrics>) -> Result<(), Box<dyn Err
         }),
         "pcap",
         metrics,
+        rich,
     )
 }
 
 /// TUI over the TLS-terminating mitm proxy.
-pub fn run_mitm(opts: ProxyOpts, metrics: Arc<Metrics>) -> Result<(), Box<dyn Error>> {
+pub fn run_mitm(opts: ProxyOpts, metrics: Arc<Metrics>, rich: bool) -> Result<(), Box<dyn Error>> {
     let source_metrics = metrics.clone();
     run(
         Box::new(move || {
@@ -68,6 +69,7 @@ pub fn run_mitm(opts: ProxyOpts, metrics: Arc<Metrics>) -> Result<(), Box<dyn Er
         }),
         "mitm",
         metrics,
+        rich,
     )
 }
 
@@ -77,6 +79,7 @@ fn run(
     source: Box<dyn FnOnce() + Send + 'static>,
     mode: &'static str,
     metrics: Arc<Metrics>,
+    rich: bool,
 ) -> Result<(), Box<dyn Error>> {
     // One channel: the source (background thread) produces via decode::out,
     // the TUI (this thread) consumes.
@@ -90,22 +93,32 @@ fn run(
     let _rate_sampler = metrics.spawn_rate_sampler()?;
 
     let mut terminal = ratatui::try_init()?;
-    let result = app_loop(&mut terminal, App::new(rx, mode, metrics));
+    let result = app_loop(&mut terminal, App::new(rx, mode, metrics, rich));
     // Restore the terminal even on error. try_init installs a panic hook that
     // also restores, so panics are covered too.
     let _ = ratatui::try_restore();
     result.map_err(Into::into)
 }
 
+/// One retained decoded record: the line-view text plus, optionally, the
+/// structured detail the rich view renders instead of that text.
+struct Entry {
+    text: String,
+    detail: Option<decode::EventDetail>,
+}
+
 struct App {
     rx: Receiver<Output>,
-    events: Vec<String>,
+    events: Vec<Entry>,
     /// Index of the top visible line into the event buffer.
     scroll: usize,
     /// Auto-tail new output.
     follow: bool,
     /// Wrap long lines to the viewport width.
     wrap: bool,
+    /// Rich display mode: draw `DataRow` as a per-message key/value table and
+    /// `RowDescription` as a typed column list, instead of the flat line.
+    rich: bool,
     mode: &'static str,
     metrics: Arc<Metrics>,
     /// All-time peak messages/sec seen this session, per direction. Used as a
@@ -116,13 +129,19 @@ struct App {
 }
 
 impl App {
-    fn new(rx: Receiver<Output>, mode: &'static str, metrics: Arc<Metrics>) -> Self {
+    fn new(
+        rx: Receiver<Output>,
+        mode: &'static str,
+        metrics: Arc<Metrics>,
+        rich: bool,
+    ) -> Self {
         Self {
             rx,
             events: Vec::new(),
             scroll: 0,
             follow: true,
             wrap: false,
+            rich,
             mode,
             metrics,
             peak_msgs_in: 0,
@@ -134,10 +153,11 @@ impl App {
 fn app_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Result<()> {
     loop {
         while let Ok(record) = app.rx.try_recv() {
-            let line = match record {
-                Output::Line(s) | Output::Status(s) => s,
+            let evt = match record {
+                Output::Line(s) | Output::Status(s) => Entry { text: s, detail: None },
+                Output::Rich { text, detail } => Entry { text, detail: Some(detail) },
             };
-            app.events.push(line);
+            app.events.push(evt);
         }
         if app.events.len() > HISTORY_CAP {
             let drop_n = app.events.len() - HISTORY_CAP;
@@ -151,7 +171,12 @@ fn app_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Result
         // In wrap mode an event may span several rows, so the viewport holds
         // fewer than `log_h` events; allow scrolling up to the last event.
         // Otherwise the viewport shows `log_h` events.
-        let max_scroll = if app.wrap {
+        // Wrap mode and rich mode both let a single event span several rows
+        // (wrapped lines, or a key/value table), so scrolling is indexed by
+        // event and may reach the last one. In the plain one-row-per-event
+        // view, cap so the window stays full instead of stranding the last
+        // event at the top with empty space below.
+        let max_scroll = if app.wrap || app.rich {
             app.events.len().saturating_sub(1)
         } else {
             app.events.len().saturating_sub(log_h)
@@ -225,6 +250,7 @@ fn handle_key(app: &mut App, log_h: usize, key: KeyEvent) -> bool {
         }
         KeyCode::Char('f') => app.follow = !app.follow,
         KeyCode::Char('w') => app.wrap = !app.wrap,
+        KeyCode::Char('r') => app.rich = !app.rich,
         KeyCode::Char('c') => app.events.clear(),
         _ => {}
     }
@@ -363,24 +389,35 @@ fn draw(frame: &mut Frame, app: &App, log_h: usize) {
     let inner_w = log_area.width.saturating_sub(2) as usize;
     // Size the window by display rows so every shown item is fully visible (no
     // mid-item clipping): follow fills backward from the newest event, else
-    // forward from the scroll anchor. Without wrap each item is one row.
-    let (start, end) = if app.wrap {
-        wrap_window(&app.events, app.scroll, app.follow, log_h, inner_w)
+    // forward from the scroll anchor. Wrap mode and rich mode both need this —
+    // an event may span many rows (wrapped text, or a key/value table) — so
+    // they share the row-counted window; the plain one-row view stays on the
+    // cheap fixed-slice path.
+    let (start, end) = if app.wrap || app.rich {
+        view_window(
+            &app.events,
+            app.scroll,
+            app.follow,
+            log_h,
+            inner_w,
+            app.rich,
+            app.wrap,
+        )
     } else {
         let s = app.scroll;
         (s, (s + log_h).min(app.events.len()))
     };
-    let lines: Vec<Line> = app.events[start..end]
-        .iter()
-        .map(|l| build_line(l.as_str()))
-        .collect();
+    let mut lines: Vec<Line> = Vec::new();
+    for evt in &app.events[start..end] {
+        lines.extend(event_lines(evt, app.rich));
+    }
     let mut para = Paragraph::new(Text::from(lines)).block(log_block);
     if app.wrap {
         para = para.wrap(Wrap { trim: false });
     }
     frame.render_widget(para, log_area);
 
-    // --- footer: follow/wrap state shown by colour (green = on) ---
+    // --- footer: follow/wrap/rich state shown by colour (green = on) ---
     let on = Style::default().fg(Color::Green);
     let off = Style::default();
     let footer = Line::from(vec![
@@ -388,6 +425,8 @@ fn draw(frame: &mut Frame, app: &App, log_h: usize) {
         Span::styled("follow", if app.follow { on } else { off }),
         Span::raw(" · w "),
         Span::styled("wrap", if app.wrap { on } else { off }),
+        Span::raw(" · r "),
+        Span::styled("rich", if app.rich { on } else { off }),
         Span::raw(" · c clear "),
     ]);
     frame.render_widget(Paragraph::new(footer).block(Block::bordered()), foot_area);
@@ -442,32 +481,30 @@ fn stat_text(
     ])
 }
 
-/// In wrap mode, pick the slice `[start, end)` of events to render so the
-/// viewport is filled with whole items (no row clipped mid-item): follow fills
-/// backward from the newest event; otherwise fill forward from the `scroll`
-/// anchor. `width` is the inner (post-border) column count.
-fn wrap_window(
-    events: &[String],
+/// Pick the slice `[start, end)` of events to render so the viewport is filled
+/// with whole items (no row clipped mid-item): follow fills backward from the
+/// newest event; otherwise fill forward from the `scroll` anchor. `width` is
+/// the inner (post-border) column count. Shared by the wrapped line view and
+/// the multi-row rich tables — both key event height off [`event_height`] —
+/// so an item that spans several rows is never cut in half.
+fn view_window(
+    events: &[Entry],
     scroll: usize,
     follow: bool,
     log_h: usize,
     width: usize,
+    rich: bool,
+    wrap: bool,
 ) -> (usize, usize) {
     let n = events.len();
     if n == 0 {
         return (0, 0);
     }
-    let height = |s: &str| {
-        Paragraph::new(build_line(s))
-            .wrap(Wrap { trim: false })
-            .line_count(width as u16)
-            .max(1)
-    };
     let mut rows = 0usize;
     if follow {
         let mut start = n;
         for (i, evt) in events.iter().enumerate().rev() {
-            let h = height(evt.as_str());
+            let h = event_height(evt, width, rich, wrap);
             if rows != 0 && rows + h > log_h {
                 break;
             }
@@ -481,7 +518,7 @@ fn wrap_window(
     } else {
         let mut end = scroll;
         for (i, evt) in events.iter().enumerate().skip(scroll) {
-            let h = height(evt.as_str());
+            let h = event_height(evt, width, rich, wrap);
             if rows != 0 && rows + h > log_h {
                 break;
             }
@@ -493,6 +530,104 @@ fn wrap_window(
         }
         (scroll, end)
     }
+}
+
+/// Display rows an event occupies: the flat line view is one row (or its
+/// wrapped height in wrap mode); a rich `DataRow`/`RowDescription` is one
+/// header row plus one row per column. In wrap mode any of those lines may
+/// further reflow, so defer to ratatui's `Paragraph::line_count`.
+fn event_height(evt: &Entry, width: usize, rich: bool, wrap: bool) -> usize {
+    if wrap {
+        return Paragraph::new(Text::from(event_lines(evt, rich)))
+            .wrap(Wrap { trim: false })
+            .line_count(width as u16)
+            .max(1);
+    }
+    if rich {
+        match &evt.detail {
+            Some(decode::EventDetail::DataRow(cols)) => 1 + cols.len(),
+            Some(decode::EventDetail::RowDescription(fields)) => 1 + fields.len(),
+            None => 1,
+        }
+    } else {
+        1
+    }
+}
+
+/// The lines an event renders as: the flat line view, or — in rich mode, when
+/// structured detail is available — a header line followed by a key/value (or
+/// typed column) breakdown.
+fn event_lines<'a>(evt: &'a Entry, rich: bool) -> Vec<Line<'a>> {
+    if rich {
+        if let Some(detail) = &evt.detail {
+            return render_rich(&evt.text, detail);
+        }
+    }
+    vec![build_line(&evt.text)]
+}
+
+/// Render a structured event for rich mode: the normal prefix line, then one
+/// row per field. A `DataRow` becomes a `name = value` list; a
+/// `RowDescription` becomes a `name  type` list. Field names reuse the cyan
+/// direction colour so the key column reads like a header.
+fn render_rich<'a>(text: &'a str, detail: &'a decode::EventDetail) -> Vec<Line<'a>> {
+    let key = Style::default().fg(Color::Cyan).bold();
+    let dim = Style::default().fg(Color::DarkGray);
+    let mut lines = vec![build_line(text)];
+    match detail {
+        decode::EventDetail::DataRow(cols) => {
+            for c in cols {
+                lines.push(Line::from(vec![
+                    Span::raw("   "),
+                    Span::styled(c.name.clone(), key),
+                    Span::raw(" = "),
+                    Span::raw(c.value.clone()),
+                    Span::styled(format!("  {}", type_label(c.type_oid)), dim),
+                ]));
+            }
+        }
+        decode::EventDetail::RowDescription(fields) => {
+            for f in fields {
+                lines.push(Line::from(vec![
+                    Span::raw("   "),
+                    Span::styled(f.name.clone(), key),
+                    Span::raw("  "),
+                    Span::styled(type_label(f.type_oid), Style::default().fg(Color::Gray)),
+                ]));
+            }
+        }
+    }
+    lines
+}
+
+/// Human-friendly type name for common PostgreSQL OIDs, falling back to the
+/// numeric OID. This is the safe textual fallback issue #15 asks for — no
+/// glyph/font assumptions — and is the place glyphs will slot in behind a
+/// `--no-glyphs`/env flag later.
+fn type_label(oid: u32) -> String {
+    let name = match oid {
+        16 => "bool",
+        17 => "bytea",
+        18 => "char",
+        19 => "name",
+        20 => "int8",
+        21 => "int2",
+        23 => "int4",
+        25 => "text",
+        114 => "json",
+        700 => "float4",
+        701 => "float8",
+        1043 => "varchar",
+        1082 => "date",
+        1114 => "timestamp",
+        1184 => "timestamptz",
+        1186 => "interval",
+        1700 => "numeric",
+        2950 => "uuid",
+        3802 => "jsonb",
+        _ => return format!("oid={oid}"),
+    };
+    name.to_string()
 }
 
 /// Render a line with the direction symbol (`[F→B]`/`[B→F]`) highlighted in a
@@ -534,4 +669,63 @@ fn direction_split(line: &str) -> Option<(Color, usize, usize)> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::decode::{DataColumn, EventDetail};
+
+    fn data_row_detail(n: usize) -> EventDetail {
+        EventDetail::DataRow(
+            (0..n)
+                .map(|i| DataColumn {
+                    name: format!("c{i}"),
+                    type_oid: 25,
+                    value: "'v'".into(),
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn type_label_maps_common_oids_and_falls_back() {
+        assert_eq!(type_label(23), "int4");
+        assert_eq!(type_label(25), "text");
+        assert_eq!(type_label(2950), "uuid");
+        assert_eq!(type_label(9999), "oid=9999");
+    }
+
+    #[test]
+    fn event_height_counts_header_plus_each_field() {
+        let entry = Entry {
+            text: "x".into(),
+            detail: Some(data_row_detail(3)),
+        };
+        // 1 header row + 3 columns, non-wrap rich mode.
+        assert_eq!(event_height(&entry, 80, true, false), 4);
+    }
+
+    #[test]
+    fn event_height_plain_line_is_one_row() {
+        let entry = Entry { text: "x".into(), detail: None };
+        assert_eq!(event_height(&entry, 80, false, false), 1);
+        // Rich mode with no structured detail still renders the flat line.
+        assert_eq!(event_height(&entry, 80, true, false), 1);
+    }
+
+    #[test]
+    fn view_window_does_not_clip_multirow_items() {
+        // Two rich DataRows, 3 columns each -> 4 rows each. A 5-row viewport in
+        // follow mode must show only the last item fully (4 rows) rather than
+        // start the first and clip it mid-table.
+        let events: Vec<Entry> = (0..2)
+            .map(|_| Entry {
+                text: "x".into(),
+                detail: Some(data_row_detail(3)),
+            })
+            .collect();
+        let (start, end) = view_window(&events, 0, true, 5, 80, true, false);
+        assert_eq!((start, end), (1, 2));
+    }
 }

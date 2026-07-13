@@ -49,6 +49,12 @@ struct Args {
     #[arg(long, default_value_t = false)]
     tui: bool,
 
+    /// [tui] Start with rich display mode on: per-message key/value tables for
+    /// `DataRow` and typed column lists for `RowDescription`, instead of the
+    /// flat line view. Toggle at runtime with `r`.
+    #[arg(long, default_value_t = false)]
+    tui_rich: bool,
+
     /// Maximum retained open + recently-closed connection records.
     /// Open connections are never evicted.
     #[arg(long, default_value_t = state::DEFAULT_CONNECTION_CAP)]
@@ -125,7 +131,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 snaplen: args.snaplen,
             };
             if args.tui {
-                tui::run_pcap(opts, metrics)
+                tui::run_pcap(opts, metrics, args.tui_rich)
             } else {
                 run_stdout(move || capture::run(opts, metrics))
             }
@@ -140,7 +146,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 no_upstream_tls: args.no_upstream_tls,
             };
             if args.tui {
-                tui::run_mitm(opts, metrics)
+                tui::run_mitm(opts, metrics, args.tui_rich)
             } else {
                 run_stdout(move || proxy::run(opts, metrics))
             }
@@ -164,7 +170,7 @@ where
             let mut stderr = std::io::stderr().lock();
             while let Ok(record) = rx.recv() {
                 match record {
-                    decode::Output::Line(s) => {
+                    decode::Output::Line(s) | decode::Output::Rich { text: s, .. } => {
                         let _ = writeln!(stdout, "{s}");
                     }
                     decode::Output::Status(s) => {

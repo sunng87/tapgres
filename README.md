@@ -93,6 +93,7 @@ the TUI on the main thread:
 ```
 tapgres --tui                              # pcap source, interactive view
 tapgres --mode mitm --tui                  # TLS proxy source, interactive view
+tapgres --tui --tui-rich                   # ...start in rich display mode
 ```
 
 Keybindings:
@@ -104,7 +105,15 @@ Keybindings:
 | `g` / `G` | top / bottom |
 | `f` | toggle follow (auto-tail) |
 | `w` | toggle line wrap |
+| `r` | toggle rich display mode |
 | `c` | clear |
+
+**Rich display mode** (`r`, or `--tui-rich` at startup) renders structured
+messages differently from the flat line view: each `DataRow` becomes a
+per-message key/value table (`column = value`, with its type), and a
+`RowDescription` becomes a typed column list. Column names/types come from the
+connection's cached `RowDescription`, so the rich view is keyed on real field
+names. The flat line view (the default) is unchanged.
 
 The direction symbol is highlighted in a high-contrast colour (`[F→B]` cyan,
 `[B→F]` magenta) and the message name is bold; warnings are red and connection
