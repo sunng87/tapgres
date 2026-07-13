@@ -571,9 +571,14 @@ fn event_lines<'a>(evt: &'a Entry, rich: bool) -> Vec<Line<'a>> {
 /// `RowDescription` becomes a `name  type` list. Field names reuse the cyan
 /// direction colour so the key column reads like a header.
 fn render_rich<'a>(text: &'a str, detail: &'a decode::EventDetail) -> Vec<Line<'a>> {
-    let key = Style::default().fg(Color::Cyan).bold();
+    // Yellow for field names so the key column reads as a header and stays
+    // distinct from the cyan/magenta direction colours used elsewhere.
+    let key = Style::default().fg(Color::Yellow).bold();
     let dim = Style::default().fg(Color::DarkGray);
-    let mut lines = vec![build_line(text)];
+    // The structured rows below ARE the content, so the header carries only the
+    // timestamp/direction/kind — not the line-view summary text, which would
+    // just duplicate the table.
+    let mut lines = vec![build_header_line(text)];
     match detail {
         decode::EventDetail::DataRow(cols) => {
             for c in cols {
@@ -641,23 +646,60 @@ fn build_line(line: &str) -> Line<'_> {
     if line.contains("===") {
         return Line::styled(line, Style::default().fg(Color::Yellow));
     }
-    let Some((color, start, end)) = direction_split(line) else {
+    let Some(p) = parse_line(line) else {
         return Line::styled(line, Style::default());
     };
-    // "[ts] [F→B] KIND: text" -> prefix | symbol | gap | kind | rest.
-    // Skip the single space after the symbol closing bracket.
-    let kind_start = (end + 1).min(line.len());
+    Line::from(vec![
+        Span::raw(&line[..p.prefix_end]).fg(Color::DarkGray),
+        Span::raw(&line[p.prefix_end..p.tag_end]).fg(p.color).bold(),
+        Span::raw(&line[p.tag_end..p.kind_start]),
+        Span::raw(&line[p.kind_start..p.kind_end]).fg(p.color).bold(),
+        Span::raw(&line[p.kind_end..]),
+    ])
+}
+
+/// Like [`build_line`] but stops after the message kind, dropping the trailing
+/// content. Used as the header of a rich table, where that content is rendered
+/// as the structured rows below instead of being duplicated in the header.
+fn build_header_line(line: &str) -> Line<'_> {
+    let Some(p) = parse_line(line) else {
+        return Line::styled(line, Style::default());
+    };
+    Line::from(vec![
+        Span::raw(&line[..p.prefix_end]).fg(Color::DarkGray),
+        Span::raw(&line[p.prefix_end..p.tag_end]).fg(p.color).bold(),
+        Span::raw(&line[p.tag_end..p.kind_start]),
+        Span::raw(&line[p.kind_start..p.kind_end]).fg(p.color).bold(),
+    ])
+}
+
+/// The coloured segments of a decoded line `[ts] [F→B] Kind[: rest]`.
+/// [`direction_split`] supplies the tag colour and bounds; the rest is computed
+/// here so [`build_line`] (full line) and [`build_header_line`] (kind only)
+/// share a single parser and never drift apart.
+struct LineParts {
+    color: Color,
+    prefix_end: usize,
+    tag_end: usize,
+    kind_start: usize,
+    kind_end: usize,
+}
+
+fn parse_line(line: &str) -> Option<LineParts> {
+    let (color, prefix_end, tag_end) = direction_split(line)?;
+    // Skip the single space after the tag's closing bracket.
+    let kind_start = (tag_end + 1).min(line.len());
     let kind_end = line[kind_start..]
         .find(": ")
         .map(|p| kind_start + p)
         .unwrap_or(line.len());
-    Line::from(vec![
-        Span::raw(&line[..start]).fg(Color::DarkGray),
-        Span::raw(&line[start..end]).fg(color).bold(),
-        Span::raw(&line[end..kind_start]),
-        Span::raw(&line[kind_start..kind_end]).fg(color).bold(),
-        Span::raw(&line[kind_end..]),
-    ])
+    Some(LineParts {
+        color,
+        prefix_end,
+        tag_end,
+        kind_start,
+        kind_end,
+    })
 }
 
 /// If `line` carries a direction tag, return `(colour, byte start, byte end)`
@@ -727,5 +769,26 @@ mod tests {
             .collect();
         let (start, end) = view_window(&events, 0, true, 5, 80, true, false);
         assert_eq!((start, end), (1, 2));
+    }
+
+    #[test]
+    fn rich_header_omits_line_view_content() {
+        // The line-view text carries the row content; rich mode must not repeat
+        // it in the header, since the table body below already shows it.
+        let text = "[00:00:00.000] [B→F] DataRow: { name='alice' }";
+        let detail = EventDetail::DataRow(vec![DataColumn {
+            name: "name".into(),
+            type_oid: 25,
+            value: "'alice'".into(),
+        }]);
+        let rendered = render_rich(text, &detail);
+        let header: String = rendered[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(header.contains("DataRow"), "header: {header}");
+        assert!(
+            !header.contains("alice"),
+            "header must not repeat row content: {header}"
+        );
+        let body: String = rendered[1].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(body.contains("alice"), "body should carry the value: {body}");
     }
 }
