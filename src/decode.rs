@@ -29,7 +29,7 @@ use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage, SslNegotiati
 
 /// A stripped-down description of one result column, kept so that `DataRow`s
 /// can be labelled and rendered with the right (text/binary) format.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct FieldSummary {
     pub name: String,
     pub type_oid: u32,
@@ -44,6 +44,31 @@ impl From<&FieldDescription> for FieldSummary {
             format_code: f.format_code,
         }
     }
+}
+
+/// Structured rendering detail for a decoded message, consumed by the TUI's
+/// *rich* display mode. The flat line-view text is always produced as well,
+/// so non-TUI consumers and the line view are unaffected; this just lets the
+/// TUI draw certain messages (a `DataRow` as a key/value table, a
+/// `RowDescription` as a typed column list) instead of that flat line.
+#[derive(Clone, Debug)]
+pub enum EventDetail {
+    /// A `RowDescription`: the result columns' names, type OIDs and format.
+    RowDescription(Vec<FieldSummary>),
+    /// A `DataRow`: each value paired with its column name and type OID. The
+    /// names/types come from the connection's cached `RowDescription`, so
+    /// this is only emitted while one is cached (otherwise the flat line view
+    /// is used, since there is nothing to key the table on).
+    DataRow(Vec<DataColumn>),
+}
+
+/// One decoded cell of a `DataRow`, labelled with its column metadata and
+/// pre-formatted for display (text values quoted, binary values hex-encoded).
+#[derive(Clone, Debug)]
+pub struct DataColumn {
+    pub name: String,
+    pub type_oid: u32,
+    pub value: String,
 }
 
 /// Current wall-clock time, for log line prefixes.
@@ -74,6 +99,10 @@ pub enum Output {
     Line(String),
     /// A status/informational line.
     Status(String),
+    /// A decoded protocol line plus structured `detail` the TUI may render in
+    /// rich mode. `text` is the same line-view string the other variants
+    /// carry; stdout consumers just print `text` and ignore `detail`.
+    Rich { text: String, detail: EventDetail },
 }
 
 /// The global producer handle. `None` (the default) means no consumer is wired
@@ -96,8 +125,13 @@ fn deliver(record: Output) {
     // Tests capture decoded lines locally (no consumer thread / channel).
     let buffered = CAPTURE.with(|c| c.borrow().is_some());
     if buffered {
-        if let Output::Line(s) = record {
-            CAPTURE.with(|c| c.borrow_mut().as_mut().unwrap().push(s));
+        // The line-view text is what tests assert on; `Rich` carries that same
+        // text, so capture it like a `Line` and drop the structured detail.
+        match record {
+            Output::Line(s) | Output::Rich { text: s, .. } => {
+                CAPTURE.with(|c| c.borrow_mut().as_mut().unwrap().push(s));
+            }
+            Output::Status(_) => {}
         }
         return;
     }
@@ -107,7 +141,7 @@ fn deliver(record: Output) {
     }
     // No consumer wired: fall back to direct terminal output.
     match record {
-        Output::Line(s) => println!("{s}"),
+        Output::Line(s) | Output::Rich { text: s, .. } => println!("{s}"),
         Output::Status(s) => eprintln!("{s}"),
     }
 }
@@ -116,6 +150,13 @@ fn deliver(record: Output) {
 /// none is wired.
 pub fn out(line: String) {
     deliver(Output::Line(line));
+}
+
+/// Emit a decoded protocol line with structured `detail` for the TUI's rich
+/// mode. `line` is exactly the text the line view would show; stdout consumers
+/// print it unchanged.
+pub fn out_rich(line: String, detail: EventDetail) {
+    deliver(Output::Rich { text: line, detail });
 }
 
 /// Emit a status/informational line. On the stdout path it goes to stderr; under
@@ -148,6 +189,17 @@ fn emit(role: Role, kind: &str, text: &str) {
     } else {
         out(format!("[{}] [{}] {}: {}", ts(), dir_tag(role), kind, text));
     }
+}
+
+/// Like [`emit`] but attaches structured `detail` for rich-mode rendering.
+/// The line text is built identically to [`emit`].
+fn emit_rich(role: Role, kind: &str, text: &str, detail: EventDetail) {
+    let line = if text.is_empty() {
+        format!("[{}] [{}] {}", ts(), dir_tag(role), kind)
+    } else {
+        format!("[{}] [{}] {}: {}", ts(), dir_tag(role), kind, text)
+    };
+    out_rich(line, detail);
 }
 
 fn warn(role: Role, msg: &str) {
@@ -382,18 +434,42 @@ fn handle_backend(
         ),
         PgWireBackendMessage::RowDescription(r) => {
             let summary: Vec<FieldSummary> = r.fields.iter().map(FieldSummary::from).collect();
-            emit(Role::Server, "RowDescription", &format_row_desc(&summary));
+            emit_rich(
+                Role::Server,
+                "RowDescription",
+                &format_row_desc(&summary),
+                EventDetail::RowDescription(summary.clone()),
+            );
+            // Cache for subsequent `DataRow`s. NOT cleared at `ReadyForQuery`:
+            // in the extended protocol a statement/portal is described once but
+            // may be executed across many ReadyForQuery cycles, so the columns
+            // must outlive a single command cycle.
             dir.row_desc = Some(summary);
         }
         PgWireBackendMessage::NoData(_) => {
             dir.row_desc = None;
             emit(Role::Server, "NoData", "");
         }
-        PgWireBackendMessage::DataRow(r) => emit(
-            Role::Server,
-            "DataRow",
-            &format_data_row(&r, dir.row_desc.as_deref()),
-        ),
+        PgWireBackendMessage::DataRow(r) => {
+            // Pair the row with the cached description up front so we both
+            // format the line-view text and build the structured columns from a
+            // single pass over the payload.
+            let desc = dir.row_desc.as_deref();
+            let columns = data_row_columns(&r, desc);
+            let text = format_columns(&columns, desc.is_some());
+            if desc.is_some() {
+                emit_rich(
+                    Role::Server,
+                    "DataRow",
+                    &text,
+                    EventDetail::DataRow(columns),
+                );
+            } else {
+                // No cached description -> nothing to key a table on; emit the
+                // flat line view only.
+                emit(Role::Server, "DataRow", &text);
+            }
+        }
         PgWireBackendMessage::ParameterDescription(p) => {
             emit(Role::Server, "ParameterDescription", &format_oids(&p.types))
         }
@@ -664,50 +740,89 @@ fn format_row_desc(fields: &[FieldSummary]) -> String {
     parts.join(", ")
 }
 
-fn format_data_row(r: &DataRow, desc: Option<&[FieldSummary]>) -> String {
+/// One field's worth of bytes read from a `DataRow` payload, or a marker that
+/// the row ran out mid-field (so the remaining fields are unknown).
+enum FieldRead<'a> {
+    /// A SQL NULL (`-1` length).
+    Null,
+    /// `len` bytes of column data.
+    Bytes(&'a [u8]),
+    /// The payload was shorter than expected; no more fields can be read.
+    Truncated,
+}
+
+/// Read one field from a `DataRow` payload. Returns the value and whether more
+/// fields may follow (`false` once the payload is exhausted mid-field).
+fn read_field<'a>(b: &mut &'a [u8]) -> (FieldRead<'a>, bool) {
+    if b.remaining() < 4 {
+        return (FieldRead::Truncated, false);
+    }
+    let len = b.get_i32();
+    if len < 0 {
+        return (FieldRead::Null, true);
+    }
+    let len = len as usize;
+    if b.remaining() < len {
+        return (FieldRead::Truncated, false);
+    }
+    let bytes = &b[..len];
+    b.advance(len);
+    (FieldRead::Bytes(bytes), true)
+}
+
+/// Decode a `DataRow` into one [`DataColumn`] per field, using `desc` for the
+/// column name/type OID and to pick text-vs-binary rendering. On a truncated
+/// payload the offending field becomes `<?>` and later fields are dropped,
+/// matching the historical line formatter.
+fn data_row_columns(r: &DataRow, desc: Option<&[FieldSummary]>) -> Vec<DataColumn> {
     let mut b: &[u8] = &r.data;
-    let mut values: Vec<String> = Vec::with_capacity(r.field_count.max(0) as usize);
+    let mut cols: Vec<DataColumn> = Vec::with_capacity(r.field_count.max(0) as usize);
 
     for i in 0..r.field_count.max(0) {
-        if b.remaining() < 4 {
-            values.push("<?>".into());
-            break;
-        }
-        let len = b.get_i32();
-        if len < 0 {
-            values.push("NULL".into());
-            continue;
-        }
-        let len = len as usize;
-        if b.remaining() < len {
-            values.push("<?>".into());
-            break;
-        }
-        let bytes = &b[..len];
-        b.advance(len);
-        let binary = desc
-            .and_then(|d| d.get(i as usize))
-            .map(|f| f.format_code == FORMAT_CODE_BINARY)
-            .unwrap_or(false);
-        values.push(if binary {
-            hex_preview(bytes)
-        } else {
-            quote(bytes)
+        let field = desc.and_then(|d| d.get(i as usize));
+        let (read, more) = read_field(&mut b);
+        let value = match read {
+            FieldRead::Null => "NULL".to_string(),
+            FieldRead::Truncated => "<?>".to_string(),
+            FieldRead::Bytes(bytes) => {
+                let binary = field
+                    .map(|f| f.format_code == FORMAT_CODE_BINARY)
+                    .unwrap_or(false);
+                if binary {
+                    hex_preview(bytes)
+                } else {
+                    quote(bytes)
+                }
+            }
+        };
+        cols.push(DataColumn {
+            name: field
+                .map(|f| f.name.clone())
+                .unwrap_or_else(|| "?".to_string()),
+            type_oid: field.map(|f| f.type_oid).unwrap_or(0),
+            value,
         });
+        if !more {
+            break;
+        }
     }
+    cols
+}
 
-    if let Some(d) = desc {
-        let labelled: Vec<String> = values
+/// Render decoded columns as the line-view text. `labelled` selects the
+/// `{ name=v, ... }` form (used when a `RowDescription` is cached) over the
+/// nameless `[v, ...]` form. Kept byte-for-byte compatible with the original
+/// inline formatter so existing assertions still hold.
+fn format_columns(cols: &[DataColumn], labelled: bool) -> String {
+    if labelled {
+        let parts: Vec<String> = cols
             .iter()
-            .enumerate()
-            .map(|(i, v)| {
-                let name = d.get(i).map(|f| f.name.as_str()).unwrap_or("?");
-                format!("{}={}", name, v)
-            })
+            .map(|c| format!("{}={}", c.name, c.value))
             .collect();
-        format!("{{ {} }}", labelled.join(", "))
+        format!("{{ {} }}", parts.join(", "))
     } else {
-        format!("[{}]", values.join(", "))
+        let parts: Vec<String> = cols.iter().map(|c| c.value.clone()).collect();
+        format!("[{}]", parts.join(", "))
     }
 }
 
@@ -765,5 +880,108 @@ fn format_bytes(b: &Bytes) -> String {
         String::from_utf8_lossy(b).into_owned()
     } else {
         hex_preview(b)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::{BufMut, BytesMut};
+
+    fn field(name: &str, oid: u32, fmt: i16) -> FieldSummary {
+        FieldSummary {
+            name: name.into(),
+            type_oid: oid,
+            format_code: fmt,
+        }
+    }
+
+    /// Build a `DataRow` payload from optional field bytes (`None` = SQL NULL).
+    fn row_from(fields: &[Option<&[u8]>]) -> DataRow {
+        let mut buf = BytesMut::new();
+        for f in fields {
+            match f {
+                None => buf.put_i32(-1),
+                Some(bytes) => {
+                    buf.put_i32(bytes.len() as i32);
+                    buf.put_slice(bytes);
+                }
+            }
+        }
+        DataRow::new(buf, fields.len() as i16)
+    }
+
+    #[test]
+    fn data_row_columns_label_text_and_binary() {
+        let desc = vec![
+            field("id", 23, FORMAT_CODE_TEXT),
+            field("blob", 17, FORMAT_CODE_BINARY),
+        ];
+        let row = row_from(&[Some(b"1"), Some(&[0x00, 0xff])]);
+        let cols = data_row_columns(&row, Some(&desc));
+        assert_eq!(cols.len(), 2);
+        assert_eq!(cols[0].name, "id");
+        assert_eq!(cols[0].type_oid, 23);
+        assert_eq!(cols[0].value, "'1'");
+        assert_eq!(cols[1].name, "blob");
+        assert_eq!(cols[1].type_oid, 17);
+        assert_eq!(cols[1].value, "00ff"); // binary -> hex
+    }
+
+    #[test]
+    fn data_row_columns_null_field() {
+        let desc = vec![field("a", 23, FORMAT_CODE_TEXT)];
+        let row = row_from(&[None]);
+        let cols = data_row_columns(&row, Some(&desc));
+        assert_eq!(cols.len(), 1);
+        assert_eq!(cols[0].value, "NULL");
+    }
+
+    #[test]
+    fn data_row_columns_truncated_field_terminates_the_row() {
+        // field_count claims 2, but the payload only holds one full field plus
+        // a length prefix that promises bytes that never arrive.
+        let desc = vec![
+            field("a", 23, FORMAT_CODE_TEXT),
+            field("b", 25, FORMAT_CODE_TEXT),
+        ];
+        let mut buf = BytesMut::new();
+        buf.put_i32(1);
+        buf.put_slice(b"1"); // field 0 complete
+        buf.put_i32(99); // field 1 claims 99 bytes, but none follow
+        let row = DataRow::new(buf, 2);
+        let cols = data_row_columns(&row, Some(&desc));
+        assert_eq!(cols.len(), 2);
+        assert_eq!(cols[0].value, "'1'");
+        assert_eq!(cols[1].value, "<?>");
+    }
+
+    #[test]
+    fn format_columns_labelled_and_plain_match_line_view() {
+        let cols = vec![
+            DataColumn {
+                name: "a".into(),
+                type_oid: 23,
+                value: "'1'".into(),
+            },
+            DataColumn {
+                name: "b".into(),
+                type_oid: 25,
+                value: "'two'".into(),
+            },
+        ];
+        assert_eq!(format_columns(&cols, true), "{ a='1', b='two' }");
+        assert_eq!(format_columns(&cols, false), "['1', 'two']");
+    }
+
+    #[test]
+    fn data_row_columns_without_desc_use_placeholder_names() {
+        let row = row_from(&[Some(b"x"), Some(b"y")]);
+        let cols = data_row_columns(&row, None);
+        assert_eq!(cols[0].name, "?");
+        assert_eq!(cols[1].name, "?");
+        assert_eq!(cols[0].value, "'x'");
+        assert_eq!(cols[1].value, "'y'");
+        assert_eq!(format_columns(&cols, false), "['x', 'y']");
     }
 }
