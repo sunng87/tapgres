@@ -56,8 +56,8 @@ struct Args {
     tui_rich: bool,
 
     /// Display only decoded messages matching this expression.
-    /// Example: client=127.0.0.1 type=Query|DataRow keyword=orders
-    #[arg(long)]
+    /// Example: message.type == "Query" and message.text contains "orders"
+    #[arg(short = 'Y', long, visible_alias = "display-filter")]
     filter: Option<DisplayFilter>,
 
     /// Maximum retained open + recently-closed connection records.

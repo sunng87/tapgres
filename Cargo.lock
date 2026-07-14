@@ -1711,6 +1711,7 @@ dependencies = [
  "pgwire",
  "ratatui",
  "rcgen",
+ "regex",
  "rustls",
  "rustls-pemfile",
  "tokio",

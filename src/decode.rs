@@ -1034,7 +1034,9 @@ mod tests {
 
     #[test]
     fn filters_only_decoded_messages() {
-        let filter = DisplayFilter::parse("type=Query keyword=orders").unwrap();
+        let filter =
+            DisplayFilter::parse("message.type == \"Query\" and message.text contains \"orders\"")
+                .unwrap();
         let query = Output::Message {
             message: DisplayMessage {
                 rendered: "query".into(),

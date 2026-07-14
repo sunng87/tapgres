@@ -1077,7 +1077,7 @@ mod tests {
         assert_eq!(app.events.len(), 4);
         assert_eq!(app.visible, vec![0, 1, 2, 3]);
 
-        app.filter_text = "port=40005 type=Query keyword=orders".into();
+        app.filter_text = "client.port == 40005 and message.type == \"Query\" and message.text contains \"orders\"".into();
         app.update_filter();
         assert_eq!(app.events.len(), 4);
         assert_eq!(app.visible, vec![0, 3]);
@@ -1088,20 +1088,37 @@ mod tests {
     }
 
     #[test]
+    fn filtering_preserves_rich_message_detail() {
+        let mut app = app();
+        app.push_output(message_with_detail(
+            "DataRow",
+            "{ id=1 }",
+            40005,
+            Some(data_row_detail(3)),
+        ));
+
+        app.filter_text = "message.type == \"DataRow\"".into();
+        app.update_filter();
+
+        assert_eq!(app.visible, vec![0]);
+        assert_eq!(event_height(&app.events[0], 80, view(true)), 4);
+    }
+
+    #[test]
     fn invalid_live_edit_preserves_last_valid_filter() {
         let mut app = app();
         app.push_output(message("Query", "SELECT 1", 40005));
         app.push_output(message("DataRow", "{ id=1 }", 40005));
 
-        app.filter_text = "type=Query".into();
+        app.filter_text = "message.type == \"Query\"".into();
         app.update_filter();
         assert_eq!(app.visible, vec![0]);
 
-        app.filter_text = "type=Query unknown=value".into();
+        app.filter_text = "message.type == \"Query\" and unknown == \"value\"".into();
         app.update_filter();
         assert!(app.filter_error.is_some());
         assert_eq!(app.visible, vec![0]);
-        assert_eq!(app.filter.expression(), "type=Query");
+        assert_eq!(app.filter.expression(), "message.type == \"Query\"");
     }
 
     #[test]
@@ -1112,7 +1129,7 @@ mod tests {
             "test",
             Arc::new(Metrics::new()),
             false,
-            DisplayFilter::parse("type=Query").unwrap(),
+            DisplayFilter::parse("message.type == \"Query\"").unwrap(),
         );
         app.push_output(message("Query", "SELECT 1", 40005));
         app.push_output(message("DataRow", "{ id=1 }", 40005));
