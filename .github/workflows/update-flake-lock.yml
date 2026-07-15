@@ -1,0 +1,52 @@
+name: Update flake.lock
+
+# Weekly lock-file bump: refreshes every flake input and opens a PR with the
+# updated `flake.lock` so changes are reviewed (and CI-verified) rather than
+# committed straight to main.
+on:
+  schedule:
+    # Every Monday at 04:30 UTC (start of week, usually low Actions queue).
+    - cron: "30 4 * * 1"
+  workflow_dispatch: # manual run, e.g. to refresh inputs on demand
+
+permissions:
+  contents: write # push the update branch
+  pull-requests: write # open the PR
+
+# A scheduled run and a manual run shouldn't race each other.
+concurrency:
+  group: update-flake-lock
+  cancel-in-progress: false
+
+jobs:
+  update:
+    name: Update flake.lock
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Match the Nix setup used by CI: same installer, same nixpkgs channel.
+      - uses: cachix/install-nix-action@v31
+        with:
+          nix_path: nixpkgs=channel:nixpkgs-unstable
+
+      - name: Update flake inputs
+        run: nix flake update
+
+      # Opens (or updates) one PR on the `update-flake-lock` branch. When there
+      # is nothing to commit the action is a no-op, so quiet weeks create no PR.
+      - name: Open pull request
+        uses: peter-evans/create-pull-request@v7
+        with:
+          commit-message: "chore(flake): update flake.lock"
+          title: "chore(flake): update flake.lock"
+          body: |
+            Automated weekly refresh of `flake.lock` inputs.
+
+            Triggered by the `Update flake.lock` workflow —
+            ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+            Review the `flake.lock` diff, then merge once CI is green.
+          branch: update-flake-lock
+          delete-branch: true
+          labels: dependencies
