@@ -396,7 +396,9 @@ fn materialize_tls(opts: &ProxyOpts) -> Result<TlsMaterial, Box<dyn Error>> {
 
 /// Generate a self-signed CA and a localhost leaf signed by it, written as PEM.
 fn generate_ca_and_leaf(dir: &Path) -> Result<(), Box<dyn Error>> {
-    use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair, KeyUsagePurpose};
+    use rcgen::{
+        BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair, KeyUsagePurpose,
+    };
 
     // --- CA ---
     let mut ca_params = CertificateParams::new(vec![])?;
@@ -505,11 +507,7 @@ mod tests {
     fn unique_temp_dir() -> std::path::PathBuf {
         static N: AtomicU64 = AtomicU64::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "tapgres-rcgen-{}-{}",
-            std::process::id(),
-            n
-        ));
+        let dir = std::env::temp_dir().join(format!("tapgres-rcgen-{}-{}", std::process::id(), n));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
