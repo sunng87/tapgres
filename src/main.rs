@@ -57,8 +57,8 @@ struct Args {
 
     /// Display only decoded messages matching this expression.
     /// Example: message.type == "Query" and message.text contains "orders"
-    #[arg(short = 'Y', long, visible_alias = "display-filter")]
-    filter: Option<DisplayFilter>,
+    #[arg(short = 'Y', long = "display-filter")]
+    display_filter: Option<DisplayFilter>,
 
     /// Maximum retained open + recently-closed connection records.
     /// Open connections are never evicted.
@@ -123,7 +123,7 @@ enum Mode {
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
-    let filter = args.filter.unwrap_or_default();
+    let filter = args.display_filter.unwrap_or_default();
     let metrics = Arc::new(state::Metrics::with_limits(
         args.conn_history,
         args.rate_history,

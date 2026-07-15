@@ -12,7 +12,7 @@
 //! - `w` — toggle line wrap
 //! - `r` — toggle rich message rendering
 //! - `c` — clear
-//! - `/` — edit the display filter
+//! - `y` — edit the display filter
 
 use crossbeam_channel::Receiver;
 use std::error::Error;
@@ -351,7 +351,7 @@ fn handle_key(app: &mut App, log_h: usize, key: KeyEvent) -> bool {
             app.events.clear();
             app.visible.clear();
         }
-        KeyCode::Char('/') => app.filter_editing = true,
+        KeyCode::Char('y') => app.filter_editing = true,
         KeyCode::Esc if !app.filter.is_empty() => app.clear_filter(),
         _ => {}
     }
@@ -496,7 +496,7 @@ fn draw(frame: &mut Frame, app: &App, log_h: usize) {
     let filter_title = if app.filter_text.is_empty() {
         " messages ".to_string()
     } else {
-        format!(" messages · filter: {} ", app.filter_text)
+        format!(" messages · display filter: {} ", app.filter_text)
     };
     let filter_color = if app.filter_error.is_some() {
         Color::Red
@@ -559,10 +559,10 @@ fn draw(frame: &mut Frame, app: &App, log_h: usize) {
             .unwrap_or_default();
         frame.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled(format!(" / {}█", app.filter_text), style),
+                Span::styled(format!(" display filter › {}█", app.filter_text), style),
                 Span::styled(detail, Style::default().fg(Color::Red)),
             ]))
-            .block(Block::bordered().title_top(" filter · Enter done · Esc clear ")),
+            .block(Block::bordered().title_top(" display filter · Enter done · Esc clear ")),
             foot_area,
         );
     } else {
@@ -573,7 +573,7 @@ fn draw(frame: &mut Frame, app: &App, log_h: usize) {
             Span::styled("wrap", if app.wrap { on } else { off }),
             Span::raw(" · r "),
             Span::styled("rich", if app.rich { on } else { off }),
-            Span::raw(" · / filter · c clear "),
+            Span::raw(" · y display filter · c clear "),
         ]);
         frame.render_widget(Paragraph::new(footer).block(Block::bordered()), foot_area);
     }
@@ -1122,7 +1122,7 @@ mod tests {
     }
 
     #[test]
-    fn slash_opens_editor_and_escape_clears_startup_filter() {
+    fn y_opens_editor_and_escape_clears_startup_display_filter() {
         let (_tx, rx) = crossbeam_channel::unbounded();
         let mut app = App::new(
             rx,
@@ -1138,7 +1138,7 @@ mod tests {
         handle_key(
             &mut app,
             10,
-            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
         );
         assert!(app.filter_editing);
         handle_key(
@@ -1151,5 +1151,25 @@ mod tests {
         assert!(app.filter.is_empty());
         assert!(app.filter_text.is_empty());
         assert_eq!(app.visible, vec![0, 1]);
+    }
+
+    #[test]
+    fn slash_remains_available_for_commands() {
+        let (_tx, rx) = crossbeam_channel::unbounded();
+        let mut app = App::new(
+            rx,
+            "test",
+            Arc::new(Metrics::new()),
+            false,
+            DisplayFilter::default(),
+        );
+
+        handle_key(
+            &mut app,
+            10,
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+        );
+
+        assert!(!app.filter_editing);
     }
 }
