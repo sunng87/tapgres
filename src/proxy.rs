@@ -396,7 +396,9 @@ fn materialize_tls(opts: &ProxyOpts) -> Result<TlsMaterial, Box<dyn Error>> {
 
 /// Generate a self-signed CA and a localhost leaf signed by it, written as PEM.
 fn generate_ca_and_leaf(dir: &Path) -> Result<(), Box<dyn Error>> {
-    use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose};
+    use rcgen::{
+        BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair, KeyUsagePurpose,
+    };
 
     // --- CA ---
     let mut ca_params = CertificateParams::new(vec![])?;
@@ -409,6 +411,10 @@ fn generate_ca_and_leaf(dir: &Path) -> Result<(), Box<dyn Error>> {
     let ca_cert = ca_params.self_signed(&ca_key)?;
     fs::write(dir.join("ca.crt"), ca_cert.pem())?;
     fs::write(dir.join("ca.key"), ca_key.serialize_pem())?;
+    // rcgen 0.14 signs the leaf through an `Issuer` built from the CA's params
+    // and key. Both are already serialized to disk above, so they can move in
+    // here without a borrow conflict.
+    let ca_issuer = Issuer::new(ca_params, ca_key);
 
     // --- leaf (localhost + loopback) ---
     let mut leaf_params = CertificateParams::new(vec![
@@ -420,7 +426,7 @@ fn generate_ca_and_leaf(dir: &Path) -> Result<(), Box<dyn Error>> {
         .distinguished_name
         .push(DnType::CommonName, "tapgres");
     let leaf_key = KeyPair::generate()?;
-    let leaf_cert = leaf_params.signed_by(&leaf_key, &ca_cert, &ca_key)?;
+    let leaf_cert = leaf_params.signed_by(&leaf_key, &ca_issuer)?;
     fs::write(dir.join("server.crt"), leaf_cert.pem())?;
     fs::write(dir.join("server.key"), leaf_key.serialize_pem())?;
     Ok(())
@@ -489,5 +495,57 @@ impl ServerCertVerifier for NoVerifier {
             SignatureScheme::RSA_PKCS1_SHA384,
             SignatureScheme::RSA_PKCS1_SHA512,
         ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// A fresh temp dir so parallel test runs don't collide.
+    fn unique_temp_dir() -> std::path::PathBuf {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("tapgres-rcgen-{}-{}", std::process::id(), n));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The rcgen 0.14 `Issuer`/`signed_by` path must still produce a CA + leaf
+    /// whose PEM artifacts are well-formed.
+    #[test]
+    fn generate_ca_and_leaf_writes_valid_pem_pair() {
+        let dir = unique_temp_dir();
+        generate_ca_and_leaf(&dir).expect("cert generation should succeed");
+
+        for name in &["ca.crt", "ca.key", "server.crt", "server.key"] {
+            let len = std::fs::metadata(dir.join(name))
+                .unwrap_or_else(|e| panic!("{name} should exist: {e}"))
+                .len();
+            assert!(len > 0, "{name} should be non-empty");
+        }
+
+        // The cert PEMs each yield exactly one certificate, and the server key
+        // yields a private key.
+        let mut rd = std::io::BufReader::new(std::fs::File::open(dir.join("ca.crt")).unwrap());
+        let ca: Vec<_> = rustls_pemfile::certs(&mut rd)
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(ca.len(), 1, "ca.crt should contain one certificate");
+
+        let mut rd = std::io::BufReader::new(std::fs::File::open(dir.join("server.crt")).unwrap());
+        let leaf: Vec<_> = rustls_pemfile::certs(&mut rd)
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(leaf.len(), 1, "server.crt should contain one certificate");
+
+        let mut rd = std::io::BufReader::new(std::fs::File::open(dir.join("server.key")).unwrap());
+        assert!(
+            rustls_pemfile::private_key(&mut rd).unwrap().is_some(),
+            "server.key should contain a private key"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
