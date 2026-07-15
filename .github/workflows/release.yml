@@ -25,7 +25,7 @@ jobs:
         run: cp result/bin/tapgres tapgres-linux-x86_64
 
       - name: Create Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: tapgres-linux-x86_64
           name: Release ${{ github.ref_name }}
