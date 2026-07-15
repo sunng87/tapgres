@@ -51,7 +51,7 @@ jobs:
           sed -i "s/^sha256sums=.*/sha256sums=('${{ steps.sha256.outputs.binary }}')/" packaging/tapgres-bin/PKGBUILD
 
       - name: Deploy tapgres-bin to AUR
-        uses: KSXGitHub/github-actions-deploy-aur@v4.1.1
+        uses: KSXGitHub/github-actions-deploy-aur@v4.2.0
         with:
           pkgname: tapgres-bin
           pkgbuild: ./packaging/tapgres-bin/PKGBUILD
@@ -65,7 +65,7 @@ jobs:
           sed -i "s/^sha256sums=.*/sha256sums=('${{ steps.sha256.outputs.source }}')/" packaging/tapgres/PKGBUILD
 
       - name: Deploy tapgres to AUR
-        uses: KSXGitHub/github-actions-deploy-aur@v4.1.1
+        uses: KSXGitHub/github-actions-deploy-aur@v4.2.0
         with:
           pkgname: tapgres
           pkgbuild: ./packaging/tapgres/PKGBUILD
