@@ -20,8 +20,9 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 
+use tapgres::cli::{Args, Mode};
 use tapgres::{capture, decode, filter::DisplayFilter, proxy, state, tui};
 
 #[derive(Parser, Debug)]

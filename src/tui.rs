@@ -697,7 +697,12 @@ fn draw(frame: &mut Frame, app: &App, log_h: usize) {
             Span::styled("wrap", if app.wrap { on } else { off }),
             Span::raw(" · r "),
             Span::styled("rich", if app.rich { on } else { off }),
-            Span::raw(" · y display filter · c clear "),
+            Span::raw(" · y "),
+            Span::styled(
+                "display filter",
+                if app.filter.is_empty() { off } else { on },
+            ),
+            Span::raw(" · c clear "),
         ]);
         frame.render_widget(Paragraph::new(footer).block(Block::bordered()), foot_area);
     }

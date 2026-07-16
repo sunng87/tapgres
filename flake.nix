@@ -43,6 +43,16 @@
           # cc-wrapper does. Bake it in explicitly so the binary runs without
           # LD_LIBRARY_PATH.
           RUSTFLAGS = "-C link-arg=-Wl,-rpath,${pkgs.libpcap.lib}/lib";
+          # The manpage is generated (never committed) from the clap CLI plus a
+          # hand-written DISPLAY FILTER EXPRESSIONS section. Build the example
+          # and run it at install time so `nix build` ships a page that always
+          # matches the current options. nixpkgs' compressManPages hook then
+          # gzip-compresses it to `share/man/man1/tapgres.1.gz`.
+          postInstall = ''
+            cargo build --release --example gen_manpage
+            install -d $out/share/man/man1
+            ./target/release/examples/gen_manpage > $out/share/man/man1/tapgres.1
+          '';
         };
 
       in
