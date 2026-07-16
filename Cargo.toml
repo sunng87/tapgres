@@ -44,10 +44,10 @@ rcgen = "0.14"
 
 # --- manpage generation (`cargo run --example gen_manpage`) ---
 # clap_mangen renders the clap `Command` (the single source of truth for all
-# options) to roff; `roff` builds the hand-written DISPLAY FILTER EXPRESSIONS
-# section with correct escaping. Both are dev-only: they never reach a normal
-# `cargo build`/release/`cargo install`.
+# options) to roff. The remaining man-page prose lives in `man/sections.md`
+# and is converted to roff by pandoc at generation time (see
+# examples/gen_manpage.rs), so no roff-building crate is needed. clap_mangen
+# is dev-only: it never reaches a normal `cargo build`/release/`cargo install`.
 [dev-dependencies]
 clap_mangen = "0.2"
-roff = "1"
 

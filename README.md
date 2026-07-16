@@ -106,8 +106,9 @@ nix develop   # Rust toolchain + libpcap + PostgreSQL 18
 cargo test
 ```
 
-The manpage is generated from the clap CLI definition; rebuild it after any
-option change:
+The manpage's options come from the clap CLI definition, and the rest of its
+prose lives in `man/sections.md` (Markdown). Regenerate it after any change —
+it needs `pandoc`, which the Nix shell above provides:
 
 ```sh
 cargo run --example gen_manpage > man/tapgres.1

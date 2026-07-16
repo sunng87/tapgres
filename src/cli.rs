@@ -18,6 +18,11 @@ use crate::state;
     name = "tapgres",
     version,
     about = "Tap a local PostgreSQL port and decode its wire traffic to stdout",
+    long_about = "tapgres reassembles each PostgreSQL connection and decodes its wire traffic \
+                  with the pgwire protocol layer. Use --mode pcap (the default) to passively \
+                  capture a local port with libpcap (cleartext only), or --mode mitm to run a \
+                  local TLS-terminating proxy that decrypts encrypted sessions. Add --tui to \
+                  either source for an interactive, scrollable, filterable view.",
     before_help = crate::tui::BANNER
 )]
 pub struct Args {
@@ -76,19 +81,28 @@ pub struct Args {
     pub upstream: String,
 
     /// [mitm] Directory for the auto-generated CA + server cert.
-    /// Defaults to `$XDG_CONFIG_HOME/tapgres` or `~/.config/tapgres`.
+    ///
+    /// Defaults to `$XDG_CONFIG_HOME/tapgres` or `~/.config/tapgres`. tapgres
+    /// writes `ca.crt`, `ca.key`, `server.crt`, and `server.key` here;
+    /// distribute `ca.crt` to clients that must trust the proxy.
     #[arg(long)]
     pub tls_dir: Option<PathBuf>,
 
     /// [mitm] PEM server cert to present to clients (overrides auto-generation).
+    ///
+    /// When unset, tapgres uses an auto-generated leaf valid for `localhost`,
+    /// `127.0.0.1`, and `::1`.
     #[arg(long)]
     pub tls_cert: Option<PathBuf>,
 
-    /// [mitm] PEM private key for --tls-cert.
+    /// [mitm] PEM private key for `--tls-cert`.
     #[arg(long)]
     pub tls_key: Option<PathBuf>,
 
     /// [mitm] Disable TLS on the upstream leg (talk cleartext to the server).
+    ///
+    /// By default the upstream leg auto-negotiates TLS (sends an `SSLRequest`
+    /// and honors the server's reply); the upstream certificate is not verified.
     #[arg(long, default_value_t = false)]
     pub no_upstream_tls: bool,
 }

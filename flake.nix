@@ -30,12 +30,28 @@
 
         # tapgres's only native dependency is libpcap. Its nixpkgs split
         # output puts the headers in `out` and the shared library in `lib`, so
-        # we need both for compile-time and runtime.
-        nativeBuildInputs = with pkgs; [ pkg-config ];
+        # we need both for compile-time and runtime. `pandoc` is needed at
+        # build time to render the man page's Markdown sections to ROFF (see
+        # examples/gen_manpage.rs).
+        nativeBuildInputs = with pkgs; [ pkg-config pandoc ];
         buildInputs = with pkgs; [ libpcap libpcap.lib ];
 
+        # Source cleaning: keep cargo's own selection (crane's
+        # commonCargoSources — every .rs/.toml/Cargo.lock across the workspace),
+        # plus the committed `man/sections.md` that the gen_manpage example
+        # embeds with include_str!. cleanCargoSource alone strips it (cargo
+        # doesn't track it), which breaks the example's build; fileset.toSource
+        # makes the extra include explicit and unambiguous.
+        src = pkgs.lib.fileset.toSource {
+          root = ./.;
+          fileset = pkgs.lib.fileset.unions [
+            (craneLib.fileset.commonCargoSources ./.)
+            ./man/sections.md
+          ];
+        };
+
         tapgres = craneLib'.buildPackage {
-          src = craneLib'.cleanCargoSource ./.;
+          inherit src;
           strictDeps = true;
           inherit nativeBuildInputs buildInputs;
           # The fenix toolchain links libpcap by name but doesn't auto-inject
@@ -43,11 +59,13 @@
           # cc-wrapper does. Bake it in explicitly so the binary runs without
           # LD_LIBRARY_PATH.
           RUSTFLAGS = "-C link-arg=-Wl,-rpath,${pkgs.libpcap.lib}/lib";
-          # The manpage is generated (never committed) from the clap CLI plus a
-          # hand-written DISPLAY FILTER EXPRESSIONS section. Build the example
-          # and run it at install time so `nix build` ships a page that always
-          # matches the current options. nixpkgs' compressManPages hook then
-          # gzip-compresses it to `share/man/man1/tapgres.1.gz`.
+          # The manpage is generated (never committed) from the clap CLI
+          # definition plus Markdown prose in `man/sections.md`. Build the
+          # gen_manpage example (which embeds the Markdown and shells out to
+          # pandoc) and run it at install time, so `nix build` ships a page
+          # that always matches the current options. nixpkgs'
+          # compressManPages hook then gzip-compresses it to
+          # `share/man/man1/tapgres.1.gz`.
           postInstall = ''
             cargo build --release --example gen_manpage
             install -d $out/share/man/man1
@@ -81,6 +99,7 @@
               "rust-analyzer"
             ])
             pkgs.postgresql_18.out
+            pkgs.pandoc
           ];
 
           buildInputs = [
