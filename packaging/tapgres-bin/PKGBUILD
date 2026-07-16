@@ -10,8 +10,9 @@ conflicts=('tapgres')
 license=('MIT')
 depends=('glibc' 'gcc-libs' 'libpcap')
 makedepends=('patchelf')
-source=("$pkgname-$pkgver::https://github.com/sunng87/tapgres/releases/download/v${pkgver}/tapgres-linux-x86_64")
-sha256sums=('SKIP') # Replaced with the real checksum by the release workflow
+source=("$pkgname-$pkgver::https://github.com/sunng87/tapgres/releases/download/v${pkgver}/tapgres-linux-x86_64"
+        "tapgres-$pkgver.1.gz::https://github.com/sunng87/tapgres/releases/download/v${pkgver}/tapgres.1.gz")
+sha256sums=('SKIP' 'SKIP') # Replaced with the real checksums by the release workflow
 
 package() {
   # The binary is produced by `nix build`, so its ELF interpreter and RUNPATH
@@ -20,4 +21,5 @@ package() {
   patchelf --set-interpreter /usr/lib/ld-linux-x86-64.so.2 "$srcdir/$pkgname-$pkgver"
   patchelf --remove-rpath "$srcdir/$pkgname-$pkgver"
   install -Dm755 "$srcdir/$pkgname-$pkgver" "$pkgdir/usr/bin/tapgres"
+  install -Dm644 "$srcdir/tapgres-$pkgver.1.gz" "$pkgdir/usr/share/man/man1/tapgres.1.gz"
 }

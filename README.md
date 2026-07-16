@@ -246,12 +246,31 @@ libpcap must be installed (e.g. `libpcap-dev` on Debian/Ubuntu,
 cargo install --path .
 ```
 
+A manual page is shipped with the Nix and Arch packages (`man tapgres`).
+To build and install it yourself from a source checkout:
+
+```sh
+cargo run --example gen_manpage > tapgres.1   # render it from the CLI
+install -Dm644 tapgres.1 /usr/local/share/man/man1/tapgres.1
+```
+
 ## Develop
 
 ```sh
 nix develop   # Rust toolchain + libpcap + PostgreSQL 18
 cargo test
 ```
+
+The manual page is generated (not committed; `man/tapgres.1` is git-ignored)
+from the clap CLI definition plus a hand-written DISPLAY FILTER EXPRESSIONS
+section. Render it to stdout after any option or display-filter change:
+
+```sh
+cargo run --example gen_manpage > man/tapgres.1   # or: cargo run --example gen_manpage -- man/tapgres.1
+```
+
+Every build channel regenerates it from the current source, so the Nix flake,
+the AUR packages, and GitHub Releases always ship an up-to-date page.
 
 ## License
 

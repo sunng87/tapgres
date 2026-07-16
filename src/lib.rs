@@ -4,6 +4,7 @@
 //! tests exercise them directly.
 
 pub mod capture;
+pub mod cli;
 pub mod decode;
 pub mod filter;
 pub mod flow;

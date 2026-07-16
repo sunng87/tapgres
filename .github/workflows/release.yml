@@ -24,10 +24,17 @@ jobs:
       - name: Copy binary
         run: cp result/bin/tapgres tapgres-linux-x86_64
 
+      - name: Copy manpage
+        # `nix build` generates the manpage fresh from the current CLI in
+        # postInstall; copy it out of the nix output as a release asset.
+        run: cp result/share/man/man1/tapgres.1.gz tapgres.1.gz
+
       - name: Create Release
         uses: softprops/action-gh-release@v3
         with:
-          files: tapgres-linux-x86_64
+          files: |
+            tapgres-linux-x86_64
+            tapgres.1.gz
           name: Release ${{ github.ref_name }}
           draft: false
           prerelease: false
@@ -38,17 +45,19 @@ jobs:
         run: |
           version=${GITHUB_REF_NAME#v}
           binary_sha=$(sha256sum tapgres-linux-x86_64 | awk '{print $1}')
+          man_sha=$(sha256sum tapgres.1.gz | awk '{print $1}')
           source_sha=$(curl -fsSL https://github.com/${{ github.repository }}/archive/refs/tags/${GITHUB_REF_NAME}.tar.gz | sha256sum | awk '{print $1}')
           {
             echo "version=$version"
             echo "binary=$binary_sha"
+            echo "man=$man_sha"
             echo "source=$source_sha"
           } >> "$GITHUB_OUTPUT"
 
       - name: Update tapgres-bin PKGBUILD
         run: |
           sed -i "s/^pkgver=.*/pkgver=${{ steps.sha256.outputs.version }}/" packaging/tapgres-bin/PKGBUILD
-          sed -i "s/^sha256sums=.*/sha256sums=('${{ steps.sha256.outputs.binary }}')/" packaging/tapgres-bin/PKGBUILD
+          sed -i "s/^sha256sums=.*/sha256sums=('${{ steps.sha256.outputs.binary }}' '${{ steps.sha256.outputs.man }}')/" packaging/tapgres-bin/PKGBUILD
 
       - name: Deploy tapgres-bin to AUR
         uses: KSXGitHub/github-actions-deploy-aur@v4.2.0
