@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use ratatui::Frame;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Alignment, Constraint, Layout};
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Paragraph, RenderDirection, Sparkline, Wrap};
@@ -36,6 +36,17 @@ use crate::state::Metrics;
 /// Cap on retained lines in the TUI's own buffer.
 const HISTORY_CAP: usize = 50_000;
 
+/// tapgres ASCII-art banner. Shown by the CLI (`--help` via `before_help`) and
+/// as the heading of the TUI startup splash.
+pub const BANNER: &str = "
+████████╗ █████╗ ██████╗  ██████╗ ██████╗ ███████╗███████╗
+╚══██╔══╝██╔══██╗██╔══██╗██╔════╝ ██╔══██╗██╔════╝██╔════╝
+   ██║   ███████║██████╔╝██║  ███╗██████╔╝█████╗  ███████╗
+   ██║   ██╔══██║██╔═══╝ ██║   ██║██╔══██╗██╔══╝  ╚════██║
+   ██║   ██║  ██║██║     ╚██████╔╝██║  ██║███████╗███████║
+   ╚═╝   ╚═╝  ╚═╝╚═╝      ╚═════╝ ╚═╝  ╚═╝╚══════╝╚══════╝
+";
+
 /// TUI over the passive pcap capture.
 pub fn run_pcap(
     opts: PcapOpts,
@@ -43,6 +54,7 @@ pub fn run_pcap(
     rich: bool,
     filter: DisplayFilter,
 ) -> Result<(), Box<dyn Error>> {
+    let splash_lines = pcap_splash_lines(&opts);
     let source_metrics = metrics.clone();
     run(
         Box::new(move || {
@@ -54,7 +66,22 @@ pub fn run_pcap(
         metrics,
         rich,
         filter,
+        splash_lines,
     )
+}
+
+/// Connection/capture info shown on the pcap splash: which interface is being
+/// sniffed and which PostgreSQL port is watched.
+fn pcap_splash_lines(opts: &PcapOpts) -> Vec<String> {
+    let iface = match &opts.interface {
+        Some(name) => name.clone(),
+        None => "lo (loopback, default)".to_string(),
+    };
+    vec![
+        format!("capturing interface:  {iface}"),
+        format!("monitoring port:      {}", opts.port),
+        "cleartext connections only".to_string(),
+    ]
 }
 
 /// TUI over the TLS-terminating mitm proxy.
@@ -64,6 +91,7 @@ pub fn run_mitm(
     rich: bool,
     filter: DisplayFilter,
 ) -> Result<(), Box<dyn Error>> {
+    let splash_lines = mitm_splash_lines(&opts);
     let source_metrics = metrics.clone();
     run(
         Box::new(move || {
@@ -85,7 +113,29 @@ pub fn run_mitm(
         metrics,
         rich,
         filter,
+        splash_lines,
     )
+}
+
+/// Connection info shown on the mitm splash: where to point the client, the
+/// upstream it forwards to, and the TLS configuration on each leg.
+fn mitm_splash_lines(opts: &ProxyOpts) -> Vec<String> {
+    let client_tls = if opts.tls_cert.is_some() {
+        "client TLS:  user-supplied certificate".to_string()
+    } else {
+        format!("client TLS:  auto CA in {}", opts.tls_dir.display())
+    };
+    let upstream_tls = if opts.no_upstream_tls {
+        "upstream:     cleartext".to_string()
+    } else {
+        "upstream:     TLS auto-negotiate".to_string()
+    };
+    vec![
+        format!("point your client at:  {}", opts.listen),
+        format!("forwarding to:         {}", opts.upstream),
+        client_tls,
+        upstream_tls,
+    ]
 }
 
 /// Install a shared sink, start `source` in a background thread, run the TUI on
@@ -96,6 +146,7 @@ fn run(
     metrics: Arc<Metrics>,
     rich: bool,
     filter: DisplayFilter,
+    splash_lines: Vec<String>,
 ) -> Result<(), Box<dyn Error>> {
     // One channel: the source (background thread) produces via decode::out,
     // the TUI (this thread) consumes.
@@ -109,7 +160,10 @@ fn run(
     let _rate_sampler = metrics.spawn_rate_sampler()?;
 
     let mut terminal = ratatui::try_init()?;
-    let result = app_loop(&mut terminal, App::new(rx, mode, metrics, rich, filter));
+    let result = app_loop(
+        &mut terminal,
+        App::new(rx, mode, metrics, rich, filter, splash_lines),
+    );
     // Restore the terminal even on error. try_init installs a panic hook that
     // also restores, so panics are covered too.
     let _ = ratatui::try_restore();
@@ -151,6 +205,11 @@ struct App {
     filter_text: String,
     filter_error: Option<String>,
     filter_editing: bool,
+    /// Mode-specific connection/capture info lines for the startup splash.
+    splash_lines: Vec<String>,
+    /// Whether the startup splash is still showing. Flips off once a real
+    /// connection is detected (see `app_loop`).
+    show_splash: bool,
 }
 
 impl App {
@@ -160,8 +219,11 @@ impl App {
         metrics: Arc<Metrics>,
         rich: bool,
         filter: DisplayFilter,
+        splash_lines: Vec<String>,
     ) -> Self {
         let filter_text = filter.expression().to_string();
+        // No splash content (e.g. unit tests) means no splash screen.
+        let show_splash = !splash_lines.is_empty();
         Self {
             rx,
             events: Vec::new(),
@@ -178,6 +240,8 @@ impl App {
             filter_text,
             filter_error: None,
             filter_editing: false,
+            splash_lines,
+            show_splash,
         }
     }
 
@@ -226,6 +290,15 @@ impl App {
         self.filter_error = None;
         self.rebuild_visible();
     }
+
+    /// Leave the splash once a real connection has been detected. Startup
+    /// status lines (capture/proxy banner text) arrive before any traffic but
+    /// do not open a connection, so they do not trigger this transition.
+    fn leave_splash_if_traffic(&mut self) {
+        if self.show_splash && self.metrics.summary().conns_opened > 0 {
+            self.show_splash = false;
+        }
+    }
 }
 
 fn app_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Result<()> {
@@ -233,6 +306,10 @@ fn app_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Result
         while let Ok(record) = app.rx.try_recv() {
             app.push_output(record);
         }
+        // Leave the splash once a real connection is detected. Startup status
+        // lines (capture/proxy banner text) arrive before any traffic but do
+        // not open a connection, so they don't trigger this transition.
+        app.leave_splash_if_traffic();
         if app.events.len() > HISTORY_CAP {
             let drop_n = app.events.len() - HISTORY_CAP;
             app.events.drain(..drop_n);
@@ -274,7 +351,13 @@ fn app_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Result
                 .max(summary.rates.iter().map(|r| r.msgs_out).max().unwrap_or(0));
         }
 
-        terminal.draw(|frame| draw(frame, &app, log_h))?;
+        terminal.draw(|frame| {
+            if app.show_splash {
+                draw_splash(frame, &app);
+            } else {
+                draw(frame, &app, log_h);
+            }
+        })?;
 
         if event::poll(Duration::from_millis(100))? {
             // Drain all currently-ready events without blocking on read().
@@ -301,6 +384,11 @@ fn handle_key(app: &mut App, log_h: usize, key: KeyEvent) -> bool {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     if key.code == KeyCode::Char('c') && ctrl {
         return true;
+    }
+    // On the splash screen only honour quit; everything else is ignored until
+    // traffic arrives and the main view takes over.
+    if app.show_splash {
+        return key.code == KeyCode::Char('q');
     }
     if app.filter_editing {
         match key.code {
@@ -356,6 +444,42 @@ fn handle_key(app: &mut App, log_h: usize, key: KeyEvent) -> bool {
         _ => {}
     }
     false
+}
+
+/// Startup splash: the banner plus mode-specific connection/capture info,
+/// shown until the first real connection is detected. Centred on screen.
+fn draw_splash(frame: &mut Frame, app: &App) {
+    let area = frame.area();
+    let banner = Style::default().fg(Color::Cyan);
+    let dim = Style::default().fg(Color::DarkGray);
+
+    let mut lines: Vec<Line> = Vec::new();
+    for art in BANNER.lines() {
+        lines.push(if art.is_empty() {
+            Line::raw("")
+        } else {
+            Line::styled(art.to_string(), banner)
+        });
+    }
+    lines.push(Line::raw(""));
+    for line in &app.splash_lines {
+        lines.push(Line::raw(format!("  {line}")));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled("  waiting for traffic…  press q to quit", dim));
+
+    // Vertically centre the splash block; horizontally centre each line.
+    let height = lines.len() as u16;
+    let [_, mid, _] = Layout::vertical([
+        Constraint::Fill(1),
+        Constraint::Length(height),
+        Constraint::Fill(1),
+    ])
+    .areas(area);
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)).alignment(Alignment::Center),
+        mid,
+    );
 }
 
 fn draw(frame: &mut Frame, app: &App, log_h: usize) {
@@ -958,6 +1082,7 @@ mod tests {
             Arc::new(Metrics::new()),
             false,
             DisplayFilter::default(),
+            Vec::new(),
         )
     }
 
@@ -1135,6 +1260,7 @@ mod tests {
             Arc::new(Metrics::new()),
             false,
             DisplayFilter::parse("message.type == \"Query\"").unwrap(),
+            Vec::new(),
         );
         app.push_output(message("Query", "SELECT 1", 40005));
         app.push_output(message("DataRow", "{ id=1 }", 40005));
@@ -1167,6 +1293,7 @@ mod tests {
             Arc::new(Metrics::new()),
             false,
             DisplayFilter::default(),
+            Vec::new(),
         );
 
         handle_key(
@@ -1176,5 +1303,157 @@ mod tests {
         );
 
         assert!(!app.filter_editing);
+    }
+
+    #[test]
+    fn splash_shown_only_when_there_are_lines() {
+        // No splash content (unit tests, plain helpers) -> never show splash.
+        let (_tx, rx) = crossbeam_channel::unbounded();
+        let app = App::new(
+            rx,
+            "test",
+            Arc::new(Metrics::new()),
+            false,
+            DisplayFilter::default(),
+            Vec::new(),
+        );
+        assert!(!app.show_splash);
+
+        // Real splash content -> show until traffic arrives.
+        let (_tx, rx) = crossbeam_channel::unbounded();
+        let mut app = App::new(
+            rx,
+            "pcap",
+            Arc::new(Metrics::new()),
+            false,
+            DisplayFilter::default(),
+            vec!["capturing interface: lo".into()],
+        );
+        assert!(app.show_splash);
+        // Startup status lines do not count as traffic.
+        app.push_output(Output::Status("tapgres: capturing on 'lo'".into()));
+        app.leave_splash_if_traffic();
+        assert!(app.show_splash, "status lines must not leave the splash");
+    }
+
+    #[test]
+    fn splash_leaves_once_a_connection_opens() {
+        let metrics = Arc::new(Metrics::new());
+        let (_tx, rx) = crossbeam_channel::unbounded();
+        let mut app = App::new(
+            rx,
+            "pcap",
+            metrics.clone(),
+            false,
+            DisplayFilter::default(),
+            vec!["capturing interface: lo".into()],
+        );
+        assert!(app.show_splash);
+
+        // A real connection is recorded on the metrics registry.
+        metrics.open_connection(
+            "127.0.0.1:40005".parse().unwrap(),
+            "127.0.0.1:5432".parse().unwrap(),
+            false,
+        );
+        app.leave_splash_if_traffic();
+        assert!(
+            !app.show_splash,
+            "an opened connection must leave the splash"
+        );
+    }
+
+    #[test]
+    fn splash_only_honours_quit() {
+        let (_tx, rx) = crossbeam_channel::unbounded();
+        let mut app = App::new(
+            rx,
+            "pcap",
+            Arc::new(Metrics::new()),
+            false,
+            DisplayFilter::default(),
+            vec!["capturing interface: lo".into()],
+        );
+        // `y` is a no-op on the splash: it must not open the filter editor.
+        assert!(!handle_key(
+            &mut app,
+            10,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+        ));
+        assert!(!app.filter_editing);
+        // `q` quits even from the splash.
+        assert!(handle_key(
+            &mut app,
+            10,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+        ));
+    }
+
+    #[test]
+    fn pcap_splash_shows_interface_and_port() {
+        let lines = pcap_splash_lines(&PcapOpts {
+            port: 5433,
+            interface: Some("any".into()),
+            no_promisc: false,
+            snaplen: 65535,
+        });
+        let joined = lines.join("\n");
+        assert!(joined.contains("any"), "named interface shown: {joined}");
+        assert!(joined.contains("5433"), "port shown: {joined}");
+
+        // Default interface is described as loopback.
+        let lines = pcap_splash_lines(&PcapOpts {
+            port: 5432,
+            interface: None,
+            no_promisc: false,
+            snaplen: 65535,
+        });
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("loopback"),
+            "default interface noted: {joined}"
+        );
+    }
+
+    #[test]
+    fn mitm_splash_shows_listen_upstream_and_tls() {
+        let lines = mitm_splash_lines(&ProxyOpts {
+            listen: "127.0.0.1:15432".into(),
+            upstream: "127.0.0.1:5432".into(),
+            tls_dir: std::path::PathBuf::from("/tmp/tapgres"),
+            tls_cert: None,
+            tls_key: None,
+            no_upstream_tls: false,
+        });
+        let joined = lines.join("\n");
+        assert!(joined.contains("127.0.0.1:15432"), "listen shown: {joined}");
+        assert!(
+            joined.contains("127.0.0.1:5432"),
+            "upstream shown: {joined}"
+        );
+        assert!(joined.contains("auto CA"), "auto CA noted: {joined}");
+        assert!(
+            joined.contains("TLS auto-negotiate"),
+            "upstream TLS noted: {joined}"
+        );
+
+        // A user-supplied cert and disabled upstream TLS are reflected.
+        let lines = mitm_splash_lines(&ProxyOpts {
+            listen: "127.0.0.1:15432".into(),
+            upstream: "127.0.0.1:5432".into(),
+            tls_dir: std::path::PathBuf::from("/tmp/tapgres"),
+            tls_cert: Some(std::path::PathBuf::from("cert.pem")),
+            tls_key: Some(std::path::PathBuf::from("key.pem")),
+            no_upstream_tls: true,
+        });
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("user-supplied"),
+            "user cert noted: {joined}"
+        );
+        assert!(
+            joined.contains("cleartext"),
+            "upstream cleartext noted: {joined}"
+        );
     }
 }
