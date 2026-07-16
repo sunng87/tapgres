@@ -1,6 +1,6 @@
 [package]
 name = "tapgres"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 authors = ["Ning Sun <sunng@pm.me>"]
 license = "MIT"
@@ -50,4 +50,3 @@ rcgen = "0.14"
 # is dev-only: it never reaches a normal `cargo build`/release/`cargo install`.
 [dev-dependencies]
 clap_mangen = "0.2"
-
