@@ -36,6 +36,7 @@ jobs:
             tapgres-linux-x86_64
             tapgres.1.gz
           name: Release ${{ github.ref_name }}
+          generate_release_notes: true
           draft: false
           prerelease: false
           token: ${{ secrets.GITHUB_TOKEN }}
