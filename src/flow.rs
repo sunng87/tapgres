@@ -39,6 +39,8 @@ pub struct ConnKey {
 /// decode buffer/context for that direction.
 pub struct Direction {
     pub role: Role,
+    /// Client endpoint attached to every decoded message from this connection.
+    pub client: SocketAddr,
     /// Next sequence number we want to deliver (absolute, wrapping). `None`
     /// until we observe a SYN (or, if SYN was missed, until first data).
     next_seq: Option<u32>,
@@ -53,9 +55,10 @@ pub struct Direction {
 }
 
 impl Direction {
-    fn new(role: Role) -> Self {
+    fn new(role: Role, client: SocketAddr) -> Self {
         Self {
             role,
+            client,
             next_seq: None,
             ooo: BTreeMap::new(),
             rxbuf: BytesMut::with_capacity(8 * 1024),
@@ -72,8 +75,8 @@ impl Direction {
     /// The proxy terminates TLS at the socket layer, so the first plaintext
     /// bytes are a `Startup` message — never the SSL/GSS negotiation the pcap
     /// path expects. We clear the SSL-awaiting flag accordingly.
-    pub fn for_decoding(role: Role) -> Self {
-        let mut d = Direction::new(role);
+    pub fn for_decoding(role: Role, client: SocketAddr) -> Self {
+        let mut d = Direction::new(role, client);
         d.ctx.awaiting_frontend_ssl = false;
         d
     }
@@ -146,9 +149,10 @@ pub struct Connection {
 
 impl Connection {
     fn new(stats: Arc<ConnStats>) -> Self {
+        let client = stats.client();
         Self {
-            client: Direction::new(Role::Client),
-            server: Direction::new(Role::Server),
+            client: Direction::new(Role::Client, client),
+            server: Direction::new(Role::Server, client),
             encrypted: false,
             metrics_closed: false,
             stats,

@@ -268,7 +268,7 @@ async fn pump(
     stats: Arc<ConnStats>,
     prefix: Vec<u8>,
 ) -> io::Result<()> {
-    let mut dir = Direction::for_decoding(role);
+    let mut dir = Direction::for_decoding(role, stats.client());
     let direction = if role == Role::Client {
         TrafficDirection::In
     } else {

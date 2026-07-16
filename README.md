@@ -35,6 +35,7 @@ sources, selected with `--mode`, and an optional interactive view with `--tui`:
 tapgres -p 5432                 # monitor port 5432 on loopback (default)
 tapgres -p 5432 -i eth0         # capture on a specific interface
 tapgres -p 5432 -i any          # capture on all interfaces
+tapgres --display-filter 'message.type == "Query" and message.text contains "orders"'
 ```
 
 Capturing requires privileges (`CAP_NET_RAW` or root):
@@ -107,6 +108,53 @@ Keybindings:
 | `w` | toggle line wrap |
 | `r` | toggle rich display mode |
 | `c` | clear |
+| `y` | edit the display filter |
+| `Esc` | clear the active display filter |
+
+### Display filters
+
+`--display-filter <expr>` limits decoded PostgreSQL messages in line-oriented
+output and supplies the initial display filter in `--tui`. Its `-Y` shorthand
+follows Wireshark:
+
+```sh
+tapgres --display-filter 'client.ip == 127.0.0.1 and client.port == 40005'
+tapgres -Y 'message.type in {"Query", "DataRow"} and message.text contains "order id"'
+tapgres --tui --display-filter 'message.type matches "^Ready.*"'
+```
+
+The expression language is a deliberately small, typed subset of Wireshark's
+display-filter syntax:
+
+| Field | Type | Example |
+| --- | --- | --- |
+| `client.ip` | IP address | `client.ip == 127.0.0.1` |
+| `client.port` | integer | `client.port in {40005, 40006}` |
+| `message.type` | string | `message.type == "Query"` |
+| `message.text` | string | `message.text contains "orders"` |
+| `message.direction` | `f2b` or `b2f` | `message.direction == "b2f"` |
+
+All fields support `==`, `!=`, and `in {value, ...}`. String fields also
+support case-sensitive `contains` and case-insensitive regular-expression
+`matches`. Combine predicates with `and`/`&&`, `or`/`||`, `not`/`!`, and
+parentheses; precedence is `not`, then `and`, then `or`. String values must be
+quoted. Raw strings such as `r"orders\s+WHERE"` avoid double escaping in
+regular expressions.
+
+```text
+client.ip == 127.0.0.1 and
+(message.type == "Query" or message.type == "Parse")
+
+not (message.direction == "b2f" and message.type matches r"^Error|Notice$")
+```
+
+In the TUI, press `y` to edit the display filter. Valid edits are applied
+immediately to the full retained message buffer, so previously hidden messages
+reappear when the display filter changes or is cleared. Invalid input is shown
+in the footer while the last valid display filter remains active. Press `Enter`
+to leave the editor, or `Esc` (including an empty display filter) to clear it.
+Capture errors and connection lifecycle notices remain visible because they are
+operational context rather than decoded protocol messages.
 
 **Rich display mode** (`r`, or `--tui-rich` at startup) renders structured
 messages differently from the flat line view: each `DataRow` becomes a
@@ -134,8 +182,9 @@ filtering (10,000 by default). Tune these bounds with `--conn-history` and
 stream (not TCP segments or socket reads), so they are consistent across the
 pcap and mitm sources; bytes that never form a complete message, and anything
 after SSL/GSS is accepted, are not counted.
-The message view has a green border. `--tui` with `pcap` still needs capture
-privileges.
+The message view border is green normally, yellow while a display filter is
+active, and red for invalid display-filter input. `--tui` with `pcap` still
+needs capture privileges.
 
 ## Installation
 

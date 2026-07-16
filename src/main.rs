@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use clap::{Parser, ValueEnum};
 
-use tapgres::{capture, decode, proxy, state, tui};
+use tapgres::{capture, decode, filter::DisplayFilter, proxy, state, tui};
 
 pub(crate) const BANNER: &str = "
 ████████╗ █████╗ ██████╗  ██████╗ ██████╗ ███████╗███████╗
@@ -54,6 +54,11 @@ struct Args {
     /// flat line view. Toggle at runtime with `r`.
     #[arg(long, default_value_t = false)]
     tui_rich: bool,
+
+    /// Display only decoded messages matching this expression.
+    /// Example: message.type == "Query" and message.text contains "orders"
+    #[arg(short = 'Y', long = "display-filter")]
+    display_filter: Option<DisplayFilter>,
 
     /// Maximum retained open + recently-closed connection records.
     /// Open connections are never evicted.
@@ -118,6 +123,7 @@ enum Mode {
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
+    let filter = args.display_filter.unwrap_or_default();
     let metrics = Arc::new(state::Metrics::with_limits(
         args.conn_history,
         args.rate_history,
@@ -131,9 +137,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                 snaplen: args.snaplen,
             };
             if args.tui {
-                tui::run_pcap(opts, metrics, args.tui_rich)
+                tui::run_pcap(opts, metrics, args.tui_rich, filter)
             } else {
-                run_stdout(move || capture::run(opts, metrics))
+                run_stdout(filter, move || capture::run(opts, metrics))
             }
         }
         Mode::Mitm => {
@@ -146,9 +152,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                 no_upstream_tls: args.no_upstream_tls,
             };
             if args.tui {
-                tui::run_mitm(opts, metrics, args.tui_rich)
+                tui::run_mitm(opts, metrics, args.tui_rich, filter)
             } else {
-                run_stdout(move || proxy::run(opts, metrics))
+                run_stdout(filter, move || proxy::run(opts, metrics))
             }
         }
     }
@@ -157,7 +163,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 /// Run `source` with its decoded output funneled through a single consumer
 /// thread: decoded lines to stdout, status to stderr. When `source` returns,
 /// close the channel and join the consumer so nothing is left unflushed.
-fn run_stdout<F>(source: F) -> Result<(), Box<dyn Error>>
+fn run_stdout<F>(filter: DisplayFilter, source: F) -> Result<(), Box<dyn Error>>
 where
     F: FnOnce() -> Result<(), Box<dyn Error>>,
 {
@@ -169,8 +175,14 @@ where
             let mut stdout = std::io::stdout().lock();
             let mut stderr = std::io::stderr().lock();
             while let Ok(record) = rx.recv() {
+                if !record.matches_filter(&filter) {
+                    continue;
+                }
                 match record {
-                    decode::Output::Line(s) | decode::Output::Rich { text: s, .. } => {
+                    decode::Output::Message { message, .. } => {
+                        let _ = writeln!(stdout, "{}", message.rendered);
+                    }
+                    decode::Output::Line(s) => {
                         let _ = writeln!(stdout, "{s}");
                     }
                     decode::Output::Status(s) => {

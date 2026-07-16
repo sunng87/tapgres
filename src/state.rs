@@ -356,6 +356,13 @@ impl Metrics {
     }
 }
 
+impl ConnStats {
+    /// Client endpoint associated with this connection.
+    pub fn client(&self) -> SocketAddr {
+        self.client
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
