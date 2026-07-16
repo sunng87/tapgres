@@ -2,7 +2,7 @@
 
 Tap a local PostgreSQL connection and decode its wire traffic.
 
-![tapgres TUI](screenshots/screenshots-splash.png)
+![tapgres TUI](screenshots/screenshot-splash.png)
 
 `tapgres` reassembles each connection and decodes it with the
 [`pgwire`](https://crates.io/crates/pgwire) protocol layer. It has two traffic
@@ -87,7 +87,7 @@ the upstream certificate — it assumes a local, operator-controlled server.
 
 ## Interactive TUI (`--tui`)
 
-![tapgres TUI: live connection metrics, rate sparkline, and decoded PostgreSQL traffic](screenshots/screenshots-tui.png)
+![tapgres TUI: live connection metrics, rate sparkline, and decoded PostgreSQL traffic](screenshots/screenshot-tui.png)
 
 Add `--tui` to either mode for a full-screen, scrollable view instead of
 line-oriented stdout. The chosen source runs in a background thread and feeds
