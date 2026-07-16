@@ -9,7 +9,10 @@ license=('MIT')
 conflicts=('tapgres-bin')
 provides=('tapgres')
 depends=('gcc-libs' 'libpcap')
-makedepends=('cargo')
+# `pandoc` is needed to render the man page's Markdown sections to ROFF (see
+# examples/gen_manpage.rs). `cargo` builds both the binary and the gen_manpage
+# example; the latter is run in package() to emit the manual page.
+makedepends=('cargo' 'pandoc')
 # The GitHub archive tarball extracts to tapgres-$pkgver/ (GitHub strips the
 # leading "v" from the tag) and includes Cargo.lock, so --frozen is safe.
 source=("$pkgname-$pkgver.tar.gz::https://github.com/sunng87/tapgres/archive/refs/tags/v$pkgver.tar.gz")

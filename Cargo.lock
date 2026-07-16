@@ -1848,7 +1848,6 @@ dependencies = [
  "ratatui",
  "rcgen",
  "regex",
- "roff",
  "rustls",
  "rustls-pemfile",
  "tokio",
