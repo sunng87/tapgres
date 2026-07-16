@@ -466,10 +466,7 @@ fn draw_splash(frame: &mut Frame, app: &App) {
         lines.push(Line::raw(format!("  {line}")));
     }
     lines.push(Line::raw(""));
-    lines.push(Line::styled(
-        "  waiting for traffic…  press q to quit",
-        dim,
-    ));
+    lines.push(Line::styled("  waiting for traffic…  press q to quit", dim));
 
     // Vertically centre the splash block; horizontally centre each line.
     let height = lines.len() as u16;
@@ -1355,7 +1352,10 @@ mod tests {
             false,
         );
         app.leave_splash_if_traffic();
-        assert!(!app.show_splash, "an opened connection must leave the splash");
+        assert!(
+            !app.show_splash,
+            "an opened connection must leave the splash"
+        );
     }
 
     #[test]
@@ -1404,7 +1404,10 @@ mod tests {
             snaplen: 65535,
         });
         let joined = lines.join("\n");
-        assert!(joined.contains("loopback"), "default interface noted: {joined}");
+        assert!(
+            joined.contains("loopback"),
+            "default interface noted: {joined}"
+        );
     }
 
     #[test]
@@ -1419,9 +1422,15 @@ mod tests {
         });
         let joined = lines.join("\n");
         assert!(joined.contains("127.0.0.1:15432"), "listen shown: {joined}");
-        assert!(joined.contains("127.0.0.1:5432"), "upstream shown: {joined}");
+        assert!(
+            joined.contains("127.0.0.1:5432"),
+            "upstream shown: {joined}"
+        );
         assert!(joined.contains("auto CA"), "auto CA noted: {joined}");
-        assert!(joined.contains("TLS auto-negotiate"), "upstream TLS noted: {joined}");
+        assert!(
+            joined.contains("TLS auto-negotiate"),
+            "upstream TLS noted: {joined}"
+        );
 
         // A user-supplied cert and disabled upstream TLS are reflected.
         let lines = mitm_splash_lines(&ProxyOpts {
@@ -1433,7 +1442,13 @@ mod tests {
             no_upstream_tls: true,
         });
         let joined = lines.join("\n");
-        assert!(joined.contains("user-supplied"), "user cert noted: {joined}");
-        assert!(joined.contains("cleartext"), "upstream cleartext noted: {joined}");
+        assert!(
+            joined.contains("user-supplied"),
+            "user cert noted: {joined}"
+        );
+        assert!(
+            joined.contains("cleartext"),
+            "upstream cleartext noted: {joined}"
+        );
     }
 }
