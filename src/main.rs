@@ -11,19 +11,24 @@
 //!   instead of the server; the proxy decrypts the client leg, decodes the
 //!   traffic in the middle, and forwards it to the real server. See
 //!   [`tapgres::proxy`].
+//! - `--replay FILE`: opens a versioned JSONL session instead of capturing and
+//!   feeds its decoded records through the same stdout or TUI renderer.
 //!
 //! Add `--tui` to either mode for an interactive, scrollable, filterable view
 //! instead of line-oriented stdout. See [`tapgres::tui`].
 
 use std::error::Error;
+use std::fs;
 use std::io::Write;
+use std::io::{self};
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
 
 use tapgres::cli::{Args, Mode};
-use tapgres::{capture, decode, filter::DisplayFilter, proxy, state, tui};
+use tapgres::{capture, decode, filter::DisplayFilter, proxy, session, state, tui};
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
@@ -32,6 +37,18 @@ fn main() -> Result<(), Box<dyn Error>> {
         args.conn_history,
         args.rate_history,
     ));
+    if let Some(replay) = args.replay {
+        if let Some(save) = &args.save {
+            ensure_distinct_files(&replay, save)?;
+        }
+        return if args.tui {
+            tui::run_replay(replay, metrics, args.tui_rich, filter, args.save)
+        } else {
+            run_stdout(filter, args.save, move || {
+                session::read_with(replay, decode::replay).map_err(Into::into)
+            })
+        };
+    }
     match args.mode {
         Mode::Pcap => {
             let opts = capture::PcapOpts {
@@ -41,9 +58,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                 snaplen: args.snaplen,
             };
             if args.tui {
-                tui::run_pcap(opts, metrics, args.tui_rich, filter)
+                tui::run_pcap(opts, metrics, args.tui_rich, filter, args.save)
             } else {
-                run_stdout(filter, move || capture::run(opts, metrics))
+                run_stdout(filter, args.save, move || capture::run(opts, metrics))
             }
         }
         Mode::Mitm => {
@@ -56,9 +73,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                 no_upstream_tls: args.no_upstream_tls,
             };
             if args.tui {
-                tui::run_mitm(opts, metrics, args.tui_rich, filter)
+                tui::run_mitm(opts, metrics, args.tui_rich, filter, args.save)
             } else {
-                run_stdout(filter, move || proxy::run(opts, metrics))
+                run_stdout(filter, args.save, move || proxy::run(opts, metrics))
             }
         }
     }
@@ -67,18 +84,32 @@ fn main() -> Result<(), Box<dyn Error>> {
 /// Run `source` with its decoded output funneled through a single consumer
 /// thread: decoded lines to stdout, status to stderr. When `source` returns,
 /// close the channel and join the consumer so nothing is left unflushed.
-fn run_stdout<F>(filter: DisplayFilter, source: F) -> Result<(), Box<dyn Error>>
+fn run_stdout<F>(
+    filter: DisplayFilter,
+    save: Option<PathBuf>,
+    source: F,
+) -> Result<(), Box<dyn Error>>
 where
     F: FnOnce() -> Result<(), Box<dyn Error>>,
 {
     let (tx, rx) = crossbeam_channel::unbounded();
     decode::set_output(tx);
+    let mut recorder = save.map(session::SessionWriter::create).transpose()?;
     let printer = std::thread::Builder::new()
         .name("tapgres-out".into())
-        .spawn(move || {
+        .spawn(move || -> io::Result<()> {
             let mut stdout = std::io::stdout().lock();
             let mut stderr = std::io::stderr().lock();
+            let mut recorder_error = None;
             while let Ok(record) = rx.recv() {
+                if let Some(writer) = recorder.as_mut() {
+                    if let Err(error) = writer.write(&record) {
+                        let message = format!("tapgres: recording stopped: {error}");
+                        let _ = writeln!(stderr, "{message}");
+                        recorder_error = Some(io::Error::other(message));
+                        recorder = None;
+                    }
+                }
                 if !record.matches_filter(&filter) {
                     continue;
                 }
@@ -94,13 +125,66 @@ where
                     }
                 }
             }
+            if let Some(writer) = recorder.as_mut() {
+                writer.flush().map_err(io::Error::other)?;
+            }
             let _ = stdout.flush();
             let _ = stderr.flush();
+            if let Some(error) = recorder_error {
+                return Err(error);
+            }
+            Ok(())
         })?;
     let result = source();
     decode::close_output();
-    let _ = printer.join();
-    result
+    let consumer_result = printer
+        .join()
+        .map_err(|_| io::Error::other("output consumer thread panicked"))?;
+    result?;
+    consumer_result?;
+    Ok(())
+}
+
+/// Prevent `--replay FILE --save FILE` from truncating the input before it is
+/// read. Canonicalising the existing input and the output's parent also catches
+/// equivalent relative paths and symlinked directories.
+fn ensure_distinct_files(input: &Path, output: &Path) -> Result<(), Box<dyn Error>> {
+    let input = fs::canonicalize(input)?;
+    let output_exists = output.exists();
+    let output = if output_exists {
+        fs::canonicalize(output)?
+    } else {
+        let parent = output
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let name = output
+            .file_name()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid --save path"))?;
+        fs::canonicalize(parent)?.join(name)
+    };
+    if input == output || (output_exists && files_share_identity(&input, &output)?) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--save must not overwrite the --replay input file",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn files_share_identity(left: &Path, right: &Path) -> io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    let left = fs::metadata(left)?;
+    let right = fs::metadata(right)?;
+    Ok(left.dev() == right.dev() && left.ino() == right.ino())
+}
+
+#[cfg(not(unix))]
+fn files_share_identity(_left: &Path, _right: &Path) -> io::Result<bool> {
+    Ok(false)
 }
 
 /// Default on-disk location for the auto-generated CA + server cert.

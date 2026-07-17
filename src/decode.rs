@@ -12,7 +12,7 @@ use std::sync::Mutex;
 use crossbeam_channel::Sender;
 
 use bytes::{Buf, Bytes};
-use chrono::Local;
+use chrono::{Local, SecondsFormat};
 
 use crate::filter::{DisplayFilter, DisplayMessage, MessageDirection};
 use crate::flow::{Direction, Role};
@@ -169,6 +169,13 @@ fn deliver(record: Output) {
     }
 }
 
+/// Feed a previously decoded record through the active consumer. File replay
+/// uses this entry point so it follows the exact same stdout/TUI path as live
+/// capture without exposing the decoder's routing internals.
+pub fn replay(record: Output) {
+    deliver(record);
+}
+
 /// Emit one decoded protocol line. Routed to the output consumer, or stdout if
 /// none is wired.
 pub fn out(line: String) {
@@ -224,13 +231,17 @@ impl MessageEmitter {
     }
 
     fn emit_with_detail(self, kind: &str, text: &str, detail: Option<EventDetail>) {
+        let captured_at = Local::now();
+        let timestamp = captured_at.to_rfc3339_opts(SecondsFormat::Millis, true);
+        let display_time = captured_at.format("%H:%M:%S%.3f");
         let rendered = if text.is_empty() {
-            format!("[{}] [{}] {}", ts(), dir_tag(self.role), kind)
+            format!("[{display_time}] [{}] {kind}", dir_tag(self.role))
         } else {
-            format!("[{}] [{}] {}: {}", ts(), dir_tag(self.role), kind, text)
+            format!("[{display_time}] [{}] {kind}: {text}", dir_tag(self.role))
         };
         deliver(Output::Message {
             message: DisplayMessage {
+                timestamp,
                 rendered,
                 client: self.client,
                 direction: if self.role == Role::Client {
@@ -246,9 +257,13 @@ impl MessageEmitter {
     }
 
     fn warn(self, msg: &str) {
-        let rendered = format!("[{}] [{}] ⚠ {}", ts(), dir_tag(self.role), msg);
+        let captured_at = Local::now();
+        let timestamp = captured_at.to_rfc3339_opts(SecondsFormat::Millis, true);
+        let display_time = captured_at.format("%H:%M:%S%.3f");
+        let rendered = format!("[{display_time}] [{}] ⚠ {msg}", dir_tag(self.role));
         deliver(Output::Message {
             message: DisplayMessage {
+                timestamp,
                 rendered,
                 client: self.client,
                 direction: if self.role == Role::Client {
@@ -1039,6 +1054,7 @@ mod tests {
                 .unwrap();
         let query = Output::Message {
             message: DisplayMessage {
+                timestamp: "2026-07-17T12:34:56.789+01:00".into(),
                 rendered: "query".into(),
                 client: "127.0.0.1:40005".parse().unwrap(),
                 direction: MessageDirection::FrontendToBackend,
@@ -1049,6 +1065,7 @@ mod tests {
         };
         let row = Output::Message {
             message: DisplayMessage {
+                timestamp: "2026-07-17T12:34:56.789+01:00".into(),
                 rendered: "row".into(),
                 client: "127.0.0.1:40005".parse().unwrap(),
                 direction: MessageDirection::BackendToFrontend,

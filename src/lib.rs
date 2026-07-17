@@ -10,5 +10,6 @@ pub mod filter;
 pub mod flow;
 pub mod net;
 pub mod proxy;
+pub mod session;
 pub mod state;
 pub mod tui;
