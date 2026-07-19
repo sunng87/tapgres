@@ -10,6 +10,7 @@
     flake-utils.url = "github:numtide/flake-utils";
     crane = {
       url = "github:ipetkov/crane";
+      inputs.nixpkgs.follows = "nixpkgs";
     };
   };
 

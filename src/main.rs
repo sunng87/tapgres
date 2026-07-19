@@ -92,7 +92,7 @@ fn run_stdout<F>(
 where
     F: FnOnce() -> Result<(), Box<dyn Error>>,
 {
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let (tx, rx) = decode::channel();
     decode::set_output(tx);
     let mut recorder = save.map(session::SessionWriter::create).transpose()?;
     let printer = std::thread::Builder::new()
@@ -142,6 +142,10 @@ where
         .map_err(|_| io::Error::other("output consumer thread panicked"))?;
     result?;
     consumer_result?;
+    let dropped = decode::dropped_count();
+    if dropped > 0 {
+        eprintln!("tapgres: dropped {dropped} output records (consumer could not keep up)");
+    }
     Ok(())
 }
 
