@@ -37,8 +37,8 @@ pub struct Args {
 
     /// [tui] Start with rich display mode on: per-message key/value tables for
     /// `DataRow` and typed column lists for `RowDescription`, instead of the
-    /// flat line view. Toggle at runtime with `r`.
-    #[arg(long, default_value_t = false)]
+    /// flat line view. Toggle at runtime with `r`. Only meaningful with --tui.
+    #[arg(long, default_value_t = false, requires = "tui")]
     pub tui_rich: bool,
 
     /// Display only decoded messages matching this expression.

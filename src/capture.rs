@@ -49,8 +49,16 @@ pub fn run(opts: PcapOpts, metrics: Arc<Metrics>) -> Result<(), Box<dyn Error>> 
         .promisc(!opts.no_promisc)
         .snaplen(opts.snaplen)
         .timeout(1000)
+        // Deliver packets as they arrive instead of in kernel-buffered batches,
+        // so an interactive tap (especially on BSD/macOS BPF) isn't delayed.
+        .immediate_mode(true)
         .open()?;
-    cap.filter(&format!("tcp port {}", opts.port), true)?;
+    // Also match VLAN-tagged frames; `net::strip_link` already unwraps 802.1Q,
+    // but the plain `tcp port` filter would never let a tagged frame through.
+    cap.filter(
+        &format!("tcp port {p} or (vlan and tcp port {p})", p = opts.port),
+        true,
+    )?;
 
     let dlt = cap.get_datalink().0;
     decode::status(format!(
@@ -60,19 +68,55 @@ pub fn run(opts: PcapOpts, metrics: Arc<Metrics>) -> Result<(), Box<dyn Error>> 
     ));
 
     let mut table = flow::ConnTable::with_metrics(metrics);
+    let mut warned_truncation = false;
+    let mut last_dropped = 0u32;
+    let mut since_stats = 0u32;
     loop {
         match cap.next_packet() {
             Ok(packet) => {
+                // Snaplen truncation guarantees a reassembly gap; warn once so
+                // the operator can raise --snaplen instead of chasing silence.
+                if packet.header.caplen < packet.header.len && !warned_truncation {
+                    warned_truncation = true;
+                    decode::status(format!(
+                        "tapgres: warning — packets truncated to {} of {} bytes; \
+                         raise --snaplen to avoid gaps in decoding",
+                        packet.header.caplen, packet.header.len
+                    ));
+                }
                 if let Some(seg) = net::parse_frame(packet.data, dlt) {
                     table.handle(&seg, opts.port);
                 }
+                since_stats += 1;
+                if since_stats >= 10_000 {
+                    since_stats = 0;
+                    report_drops(&mut cap, &mut last_dropped);
+                }
             }
-            Err(pcap::Error::TimeoutExpired) => continue,
+            Err(pcap::Error::TimeoutExpired) => {
+                report_drops(&mut cap, &mut last_dropped);
+                continue;
+            }
             Err(pcap::Error::NoMorePackets) => break,
             Err(e) => return Err(e.into()),
         }
     }
     Ok(())
+}
+
+/// Report newly kernel-dropped packets (capture couldn't keep up) since the
+/// last check, as a status line. Silent when nothing was dropped.
+fn report_drops(cap: &mut Capture<pcap::Active>, last_dropped: &mut u32) {
+    if let Ok(stats) = cap.stats() {
+        if stats.dropped > *last_dropped {
+            let delta = stats.dropped - *last_dropped;
+            *last_dropped = stats.dropped;
+            decode::status(format!(
+                "tapgres: kernel dropped {delta} packets (capture can't keep up); \
+                 decoding may have gaps"
+            ));
+        }
+    }
 }
 
 /// Resolve which capture device to use.

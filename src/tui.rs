@@ -13,13 +13,14 @@
 //! - `r` — toggle rich message rendering
 //! - `c` — clear
 //! - `y` — edit the display filter
-//! - `/` / `:` — open the command bar (`:save FILE`, `:open FILE`)
+//! - `/` — search the message text; `n`/`N` — next/previous match
+//! - `:` — open the command bar (`:save FILE`, `:open FILE`)
 
 use crossbeam_channel::Receiver;
 use std::error::Error;
 use std::io;
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ratatui::Frame;
@@ -34,13 +35,15 @@ use crate::decode::{self, Output};
 use crate::filter::DisplayFilter;
 use crate::proxy::ProxyOpts;
 use crate::session::{self, SessionWriter};
-use crate::state::Metrics;
+use crate::state::{Metrics, MetricsSummary};
 
 /// Cap on retained lines in the TUI's own buffer.
 const HISTORY_CAP: usize = 50_000;
 /// Trim in chunks during fast replay so a producer cannot grow the TUI buffer
 /// without bound while avoiding an O(n) front-drain for every single record.
 const HISTORY_TRIM_CHUNK: usize = 1_024;
+/// How many recent status/warning lines to retain for the startup splash.
+const STATUS_TAIL_CAP: usize = 8;
 
 /// tapgres ASCII-art banner. Shown by the CLI (`--help` via `before_help`) and
 /// as the heading of the TUI startup splash.
@@ -65,9 +68,7 @@ pub fn run_pcap(
     let source_metrics = metrics.clone();
     run(
         Box::new(move || {
-            if let Err(e) = crate::capture::run(opts, source_metrics) {
-                decode::status(format!("⚠ pcap source error: {e}"));
-            }
+            crate::capture::run(opts, source_metrics).map_err(|e| format!("pcap source error: {e}"))
         }),
         "pcap",
         metrics,
@@ -75,6 +76,7 @@ pub fn run_pcap(
         filter,
         splash_lines,
         save,
+        None,
     )
 }
 
@@ -104,19 +106,12 @@ pub fn run_mitm(
     let source_metrics = metrics.clone();
     run(
         Box::new(move || {
-            let rt = match tokio::runtime::Builder::new_multi_thread()
+            let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
-            {
-                Ok(rt) => rt,
-                Err(e) => {
-                    decode::status(format!("⚠ failed to start mitm runtime: {e}"));
-                    return;
-                }
-            };
-            if let Err(e) = rt.block_on(crate::proxy::serve(opts, source_metrics)) {
-                decode::status(format!("⚠ mitm source error: {e}"));
-            }
+                .map_err(|e| format!("failed to start mitm runtime: {e}"))?;
+            rt.block_on(crate::proxy::serve(opts, source_metrics))
+                .map_err(|e| format!("mitm source error: {e}"))
         }),
         "mitm",
         metrics,
@@ -124,6 +119,7 @@ pub fn run_mitm(
         filter,
         splash_lines,
         save,
+        None,
     )
 }
 
@@ -139,18 +135,16 @@ pub fn run_replay(
     let source_path = path.clone();
     run(
         Box::new(move || {
-            match session::read_tail(&source_path, HISTORY_CAP) {
-                Ok((outputs, dropped)) => {
-                    if dropped > 0 {
-                        decode::status(format!(
-                            "replay: showing the newest {HISTORY_CAP} records; {dropped} earlier records are outside TUI history"
-                        ));
-                    }
-                    outputs.into_iter().for_each(decode::replay);
-                }
-                Err(error) => decode::status(format!("⚠ replay source error: {error}")),
+            let (outputs, dropped) = session::read_tail(&source_path, HISTORY_CAP)
+                .map_err(|error| format!("replay source error: {error}"))?;
+            if dropped > 0 {
+                decode::status(format!(
+                    "replay: showing the newest {HISTORY_CAP} records; {dropped} earlier records are outside TUI history"
+                ));
             }
+            outputs.into_iter().for_each(decode::replay);
             decode::close_output();
+            Ok(())
         }),
         "replay",
         metrics,
@@ -158,6 +152,7 @@ pub fn run_replay(
         filter,
         Vec::new(),
         save,
+        Some(path),
     )
 }
 
@@ -182,33 +177,60 @@ fn mitm_splash_lines(opts: &ProxyOpts) -> Vec<String> {
     ]
 }
 
+/// The traffic source thread's body. Returns a human-readable error string on a
+/// fatal source failure (capture permission, bind failure, replay read error).
+type Source = Box<dyn FnOnce() -> Result<(), String> + Send + 'static>;
+
 /// Install a shared sink, start `source` in a background thread, run the TUI on
 /// this (main) thread, and always restore the terminal before returning.
+#[allow(clippy::too_many_arguments)]
 fn run(
-    source: Box<dyn FnOnce() + Send + 'static>,
+    source: Source,
     mode: &'static str,
     metrics: Arc<Metrics>,
     rich: bool,
     filter: DisplayFilter,
     splash_lines: Vec<String>,
     save: Option<PathBuf>,
+    replay_source: Option<PathBuf>,
 ) -> Result<(), Box<dyn Error>> {
     // One channel: the source (background thread) produces via decode::out,
-    // the TUI (this thread) consumes.
-    let (tx, rx) = crossbeam_channel::unbounded();
+    // the TUI (this thread) consumes. Bounded so a stalled UI sheds records
+    // rather than growing memory without limit (see decode::channel).
+    let (tx, rx) = decode::channel();
     decode::set_output(tx);
 
     // Validate/create the save destination before starting a live source.
     let recorder = save.map(SessionWriter::create).transpose()?;
 
-    // The source runs until the process exits; no graceful shutdown here.
+    // Shared slot the source thread writes a fatal error into, so the TUI can
+    // surface it (instead of "waiting for traffic…" forever) and exit non-zero.
+    let source_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let slot = source_error.clone();
+    // The source runs until the process exits; no graceful shutdown here. Its
+    // body is caught so a panic in the capture/decode path becomes a visible
+    // status line rather than firing ratatui's restore hook on this background
+    // thread while the main thread keeps drawing.
     let _source_thread = std::thread::Builder::new()
         .name("tapgres-source".into())
-        .spawn(source)?;
+        .spawn(move || {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(source));
+            let error = match outcome {
+                Ok(Ok(())) => None,
+                Ok(Err(e)) => Some(e),
+                Err(_) => Some("capture/decode thread panicked".to_string()),
+            };
+            if let Some(e) = error {
+                *slot.lock().unwrap() = Some(e.clone());
+                decode::status(format!("⚠ {e}"));
+            }
+        })?;
     let _rate_sampler = metrics.spawn_rate_sampler()?;
 
     let mut app = App::new(rx, mode, metrics, rich, filter, splash_lines);
     app.recorder = recorder;
+    app.source_error = source_error;
+    app.replay_source = replay_source;
     let mut terminal = ratatui::try_init()?;
     let result = app_loop(&mut terminal, app);
     // Restore the terminal even on error. try_init installs a panic hook that
@@ -231,7 +253,7 @@ struct App {
     events: Vec<Output>,
     /// Indices into `events` that match the current display filter.
     visible: Vec<usize>,
-    /// Index of the top visible line into the event buffer.
+    /// Index into `visible` of the topmost shown row (the scroll anchor).
     scroll: usize,
     /// Auto-tail new output.
     follow: bool,
@@ -252,9 +274,25 @@ struct App {
     filter_text: String,
     filter_error: Option<String>,
     filter_editing: bool,
+    /// Applied filter text captured when the editor opens, so Esc can cancel an
+    /// in-progress edit and restore it instead of wiping the filter.
+    filter_snapshot: String,
+    /// Incremental text search over the message view (`/`). Non-empty while a
+    /// search is active; `n`/`N` jump between matches and matches are highlighted.
+    search_editing: bool,
+    search_text: String,
     command_editing: bool,
     command_text: String,
     command_notice: Option<(String, bool)>,
+    /// Recent status/warning lines, surfaced on the startup splash so a fatal
+    /// source error (e.g. missing capture privileges) is visible immediately.
+    status_tail: Vec<String>,
+    /// Set by the source thread on a fatal failure; drives a non-zero exit and
+    /// leaves the splash so the error is shown.
+    source_error: Arc<Mutex<Option<String>>>,
+    /// Path of the file being replayed, if any, so `:save` refuses to overwrite
+    /// the input the source thread is still reading.
+    replay_source: Option<PathBuf>,
     /// False after `:open`: the loaded replay replaces the live view for the
     /// rest of this TUI session, while the source channel is drained safely.
     accept_source_records: bool,
@@ -298,9 +336,15 @@ impl App {
             filter_text,
             filter_error: None,
             filter_editing: false,
+            filter_snapshot: String::new(),
+            search_editing: false,
+            search_text: String::new(),
             command_editing: false,
             command_text: String::new(),
             command_notice: None,
+            status_tail: Vec::new(),
+            source_error: Arc::new(Mutex::new(None)),
+            replay_source: None,
             accept_source_records: true,
             dropped_events: 0,
             splash_lines,
@@ -322,6 +366,14 @@ impl App {
             self.recorder = None;
             self.command_notice = Some((format!("recording stopped: {error}"), true));
         }
+        // Keep the tail of status/warning lines so the splash can show them.
+        if let Output::Status(line) = &output {
+            self.status_tail.push(line.clone());
+            let len = self.status_tail.len();
+            if len > STATUS_TAIL_CAP {
+                self.status_tail.drain(..len - STATUS_TAIL_CAP);
+            }
+        }
         let index = self.events.len();
         if self.matches(&output) {
             self.visible.push(index);
@@ -332,6 +384,10 @@ impl App {
         }
     }
 
+    /// Evict the oldest events back down to the cap. Rebases the visible indices
+    /// and the scroll anchor onto the shifted buffer instead of rebuilding from
+    /// scratch, so scrollback doesn't jump to the top at steady state (and no
+    /// O(n) re-filter runs on every trim).
     fn trim_history(&mut self) {
         if self.events.len() <= HISTORY_CAP {
             return;
@@ -339,7 +395,13 @@ impl App {
         let drop_n = self.events.len() - HISTORY_CAP;
         self.events.drain(..drop_n);
         self.dropped_events = self.dropped_events.saturating_add(drop_n);
-        self.rebuild_visible();
+        // `visible` is ascending, so evicted entries are a prefix.
+        let removed_visible = self.visible.iter().take_while(|&&i| i < drop_n).count();
+        self.visible.retain(|&i| i >= drop_n);
+        for index in &mut self.visible {
+            *index -= drop_n;
+        }
+        self.scroll = self.scroll.saturating_sub(removed_visible);
     }
 
     fn rebuild_visible(&mut self) {
@@ -376,6 +438,73 @@ impl App {
         self.rebuild_visible();
     }
 
+    /// Parse the in-progress filter text for error feedback only, without
+    /// re-running it over the whole history — that (expensive) reapplication
+    /// happens on Enter via [`App::update_filter`]. Keeps the editor responsive
+    /// on a full buffer.
+    fn parse_filter_preview(&mut self) {
+        self.filter_error = if self.filter_text.trim().is_empty() {
+            None
+        } else {
+            DisplayFilter::parse(&self.filter_text)
+                .err()
+                .map(|error| error.to_string())
+        };
+    }
+
+    /// Positions into `visible` whose rendered text contains the search term
+    /// (case-insensitive). Empty when no search is active.
+    fn search_matches(&self) -> Vec<usize> {
+        if self.search_text.is_empty() {
+            return Vec::new();
+        }
+        let needle = self.search_text.to_lowercase();
+        self.visible
+            .iter()
+            .enumerate()
+            .filter(|(_, event_index)| {
+                self.events[**event_index]
+                    .rendered()
+                    .to_lowercase()
+                    .contains(&needle)
+            })
+            .map(|(position, _)| position)
+            .collect()
+    }
+
+    /// Jump to the next (`forward`) or previous match relative to the current
+    /// scroll anchor, wrapping around. `include_current` lets the initial jump
+    /// land on a match already at the anchor.
+    fn jump_to_match(&mut self, forward: bool, include_current: bool) {
+        let matches = self.search_matches();
+        let Some(&first) = matches.first() else {
+            return;
+        };
+        self.follow = false;
+        let anchor = self.scroll;
+        let target = if forward {
+            matches
+                .iter()
+                .copied()
+                .find(|&p| {
+                    if include_current {
+                        p >= anchor
+                    } else {
+                        p > anchor
+                    }
+                })
+                .unwrap_or(first)
+        } else {
+            matches
+                .iter()
+                .rev()
+                .copied()
+                .find(|&p| p < anchor)
+                .unwrap_or_else(|| *matches.last().unwrap())
+        };
+        self.scroll = target;
+    }
+
     fn execute_command(&mut self) {
         let command_text = self.command_text.clone();
         let input = command_text.trim().trim_start_matches([':', '/']).trim();
@@ -401,7 +530,13 @@ impl App {
         if argument.is_empty() {
             return Err("usage: :save FILE".into());
         }
-        let path = PathBuf::from(argument);
+        let path = expand_tilde(argument);
+        // Never truncate the file the replay source thread is still reading.
+        if let Some(source) = &self.replay_source {
+            if same_path(source, &path) {
+                return Err("refusing to overwrite the replayed input file".into());
+            }
+        }
         let mut recorder = SessionWriter::create(&path).map_err(|error| error.to_string())?;
         for output in &self.events {
             recorder.write(output).map_err(|error| error.to_string())?;
@@ -429,13 +564,17 @@ impl App {
         if argument.is_empty() {
             return Err("usage: :open FILE".into());
         }
-        let path = PathBuf::from(argument);
-        let (outputs, dropped) =
-            session::read_tail(&path, HISTORY_CAP).map_err(|error| error.to_string())?;
-        let count = outputs.len();
+        let path = expand_tilde(argument);
+        // Flush the active recorder before reading so a concurrent `:save` to the
+        // same file is on disk, not truncated out from under this read. Keep it
+        // until the read succeeds so a failed `:open` doesn't stop recording.
         if let Some(recorder) = self.recorder.as_mut() {
             recorder.flush().map_err(|error| error.to_string())?;
         }
+        let (outputs, dropped) =
+            session::read_tail(&path, HISTORY_CAP).map_err(|error| error.to_string())?;
+        let count = outputs.len();
+        // Switching to replay: stop recording live traffic.
         self.recorder = None;
         self.events = outputs;
         self.visible.clear();
@@ -458,13 +597,56 @@ impl App {
         }
     }
 
-    /// Leave the splash once a real connection has been detected. Startup
-    /// status lines (capture/proxy banner text) arrive before any traffic but
-    /// do not open a connection, so they do not trigger this transition.
-    fn leave_splash_if_traffic(&mut self) {
-        if self.show_splash && self.metrics.summary().conns_opened > 0 {
+    /// Leave the splash once a real connection has been detected, or a fatal
+    /// source error has arrived (so it isn't hidden behind "waiting for
+    /// traffic…"). Startup status lines arrive before any traffic but do not
+    /// open a connection, so they alone do not trigger this transition.
+    fn leave_splash_if_traffic(&mut self, conns_opened: u64) {
+        if self.show_splash && (conns_opened > 0 || self.source_failed()) {
             self.show_splash = false;
         }
+    }
+
+    /// Whether the source thread reported a fatal error.
+    fn source_failed(&self) -> bool {
+        self.source_error.lock().unwrap().is_some()
+    }
+}
+
+/// Expand a leading `~/` (or bare `~`) to the user's home directory so `:save`
+/// / `:open` accept the paths users naturally type.
+fn expand_tilde(input: &str) -> PathBuf {
+    if let Some(rest) = input.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return Path::new(&home).join(rest);
+        }
+    } else if input == "~" {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home);
+        }
+    }
+    PathBuf::from(input)
+}
+
+/// Whether two paths point at the same file, tolerant of one not yet existing
+/// (compares canonicalized parents so a not-yet-created `:save` target is still
+/// caught against the replay input).
+fn same_path(a: &Path, b: &Path) -> bool {
+    fn resolve(p: &Path) -> Option<PathBuf> {
+        if let Ok(canonical) = std::fs::canonicalize(p) {
+            return Some(canonical);
+        }
+        let parent = p.parent().filter(|parent| !parent.as_os_str().is_empty());
+        let name = p.file_name()?;
+        Some(
+            std::fs::canonicalize(parent.unwrap_or_else(|| Path::new(".")))
+                .ok()?
+                .join(name),
+        )
+    }
+    match (resolve(a), resolve(b)) {
+        (Some(a), Some(b)) => a == b,
+        _ => a == b,
     }
 }
 
@@ -475,11 +657,15 @@ fn app_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Result
                 app.push_output(record);
             }
         }
-        // Leave the splash once a real connection is detected. Startup status
-        // lines (capture/proxy banner text) arrive before any traffic but do
-        // not open a connection, so they don't trigger this transition.
-        app.leave_splash_if_traffic();
-        app.trim_history();
+        // One metrics snapshot per frame, shared by the splash transition, the
+        // peak-tracking below, and the header render — instead of three clones.
+        let summary = app.metrics.summary();
+        // Leave the splash once a real connection is detected (or the source
+        // failed). Startup status lines arrive before any traffic but do not
+        // open a connection, so they don't trigger this transition.
+        app.leave_splash_if_traffic(summary.conns_opened);
+        // History trimming happens in push_output as records arrive; no need to
+        // re-trim (and re-filter) every frame here.
 
         // 5 (metrics) + 3 (footer) + 2 (log block borders) rows of chrome.
         let term_h = terminal.size()?.height as usize;
@@ -506,15 +692,12 @@ fn app_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Result
         // Fixed sparkline scale: track the all-time peak messages/sec per
         // direction so the bars keep a stable scale instead of rescaling to
         // the current window's max as samples expire or arrive.
-        {
-            let summary = app.metrics.summary();
-            app.peak_msgs_in = app
-                .peak_msgs_in
-                .max(summary.rates.iter().map(|r| r.msgs_in).max().unwrap_or(0));
-            app.peak_msgs_out = app
-                .peak_msgs_out
-                .max(summary.rates.iter().map(|r| r.msgs_out).max().unwrap_or(0));
-        }
+        app.peak_msgs_in = app
+            .peak_msgs_in
+            .max(summary.rates.iter().map(|r| r.msgs_in).max().unwrap_or(0));
+        app.peak_msgs_out = app
+            .peak_msgs_out
+            .max(summary.rates.iter().map(|r| r.msgs_out).max().unwrap_or(0));
 
         terminal.draw(|frame| {
             if app.show_splash {
@@ -526,7 +709,7 @@ fn app_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Result
                     draw_command_bar(frame, &app, command_area);
                 }
             } else {
-                draw(frame, &app, log_h);
+                draw(frame, &app, log_h, &summary);
             }
         })?;
 
@@ -537,7 +720,13 @@ fn app_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Result
                     Event::Key(key)
                         if key.kind == KeyEventKind::Press && handle_key(&mut app, log_h, key) =>
                     {
-                        return Ok(());
+                        // Propagate a fatal source error as a non-zero exit, so
+                        // `--tui` matches the documented exit status of the
+                        // line-oriented path.
+                        return match app.source_error.lock().unwrap().take() {
+                            Some(e) => Err(io::Error::other(e)),
+                            None => Ok(()),
+                        };
                     }
                     // Resize / focus / mouse etc. — just trigger a redraw next loop.
                     _ => {}
@@ -553,7 +742,10 @@ fn app_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Result
 /// Handle one key. Returns `true` to quit.
 fn handle_key(app: &mut App, log_h: usize, key: KeyEvent) -> bool {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    if key.code == KeyCode::Char('c') && ctrl {
+    // Ctrl-C quits — but while editing an input it cancels that input instead of
+    // killing the whole app (handled inside each editing branch below).
+    let editing = app.command_editing || app.filter_editing || app.search_editing;
+    if key.code == KeyCode::Char('c') && ctrl && !editing {
         return true;
     }
     if app.command_editing {
@@ -562,11 +754,38 @@ fn handle_key(app: &mut App, log_h: usize, key: KeyEvent) -> bool {
                 app.command_editing = false;
                 app.command_text.clear();
             }
+            KeyCode::Char('c') if ctrl => {
+                app.command_editing = false;
+                app.command_text.clear();
+            }
             KeyCode::Enter => app.execute_command(),
             KeyCode::Backspace => {
                 app.command_text.pop();
             }
             KeyCode::Char(ch) if !ctrl => app.command_text.push(ch),
+            _ => {}
+        }
+        return false;
+    }
+    if app.search_editing {
+        match key.code {
+            // Cancel the search entirely (Esc or Ctrl-C).
+            KeyCode::Esc => {
+                app.search_editing = false;
+                app.search_text.clear();
+            }
+            KeyCode::Char('c') if ctrl => {
+                app.search_editing = false;
+                app.search_text.clear();
+            }
+            KeyCode::Enter => {
+                app.search_editing = false;
+                app.jump_to_match(true, true);
+            }
+            KeyCode::Backspace => {
+                app.search_text.pop();
+            }
+            KeyCode::Char(ch) if !ctrl => app.search_text.push(ch),
             _ => {}
         }
         return false;
@@ -587,23 +806,38 @@ fn handle_key(app: &mut App, log_h: usize, key: KeyEvent) -> bool {
     }
     if app.filter_editing {
         match key.code {
+            // Cancel the edit and restore the filter that was applied when the
+            // editor opened, rather than wiping it.
             KeyCode::Esc => {
-                app.clear_filter();
+                app.filter_text = std::mem::take(&mut app.filter_snapshot);
+                app.filter_error = None;
                 app.filter_editing = false;
             }
-            KeyCode::Enter if app.filter_error.is_none() => app.filter_editing = false,
+            KeyCode::Char('c') if ctrl => {
+                app.filter_text = std::mem::take(&mut app.filter_snapshot);
+                app.filter_error = None;
+                app.filter_editing = false;
+            }
+            // Apply on Enter (the expensive reapplication), not per keystroke.
+            KeyCode::Enter if app.filter_error.is_none() => {
+                app.update_filter();
+                app.filter_editing = false;
+            }
             KeyCode::Backspace => {
                 app.filter_text.pop();
-                app.update_filter();
+                app.parse_filter_preview();
             }
             KeyCode::Char(ch) if !ctrl => {
                 app.filter_text.push(ch);
-                app.update_filter();
+                app.parse_filter_preview();
             }
             _ => {}
         }
         return false;
     }
+    // A key in normal mode dismisses a lingering command notice so the footer
+    // key hints return.
+    app.command_notice = None;
     match key.code {
         KeyCode::Char('q') => return true,
         KeyCode::Char('j') | KeyCode::Down => {
@@ -630,16 +864,31 @@ fn handle_key(app: &mut App, log_h: usize, key: KeyEvent) -> bool {
         KeyCode::Char('f') => app.follow = !app.follow,
         KeyCode::Char('w') => app.wrap = !app.wrap,
         KeyCode::Char('r') => app.rich = !app.rich,
+        KeyCode::Char('n') => app.jump_to_match(true, false),
+        KeyCode::Char('N') => app.jump_to_match(false, false),
         KeyCode::Char('c') => {
+            // Cleared events can no longer be saved; count them so `:save`'s
+            // omission note stays accurate.
+            app.dropped_events = app.dropped_events.saturating_add(app.events.len());
             app.events.clear();
             app.visible.clear();
+            app.scroll = 0;
         }
-        KeyCode::Char('y') => app.filter_editing = true,
-        KeyCode::Char('/') | KeyCode::Char(':') => {
+        KeyCode::Char('y') => {
+            app.filter_snapshot = app.filter_text.clone();
+            app.filter_editing = true;
+        }
+        KeyCode::Char('/') => {
+            app.search_editing = true;
+            app.search_text.clear();
+        }
+        KeyCode::Char(':') => {
             app.command_editing = true;
             app.command_text.clear();
             app.command_notice = None;
         }
+        // Esc clears an active search first, then the display filter.
+        KeyCode::Esc if !app.search_text.is_empty() => app.search_text.clear(),
         KeyCode::Esc if !app.filter.is_empty() => app.clear_filter(),
         _ => {}
     }
@@ -665,6 +914,19 @@ fn draw_splash(frame: &mut Frame, app: &App) {
     for line in &app.splash_lines {
         lines.push(Line::raw(format!("  {line}")));
     }
+    // Surface recent status/warning lines so a fatal source error (e.g. missing
+    // capture privileges) is visible instead of an endless "waiting…".
+    if !app.status_tail.is_empty() {
+        lines.push(Line::raw(""));
+        for status in &app.status_tail {
+            let style = if status.contains('⚠') {
+                Style::default().fg(Color::Red)
+            } else {
+                dim
+            };
+            lines.push(Line::styled(format!("  {status}"), style));
+        }
+    }
     if let Some((notice, is_error)) = &app.command_notice {
         lines.push(Line::raw(""));
         lines.push(Line::styled(
@@ -673,10 +935,12 @@ fn draw_splash(frame: &mut Frame, app: &App) {
         ));
     }
     lines.push(Line::raw(""));
-    lines.push(Line::styled(
-        "  waiting for traffic…  press / for commands · q to quit",
-        dim,
-    ));
+    let waiting = if app.source_failed() {
+        "  source failed — see above · press q to quit"
+    } else {
+        "  waiting for traffic…  press : for commands · q to quit"
+    };
+    lines.push(Line::styled(waiting, dim));
 
     // Vertically centre the splash block; horizontally centre each line.
     let height = lines.len() as u16;
@@ -692,7 +956,7 @@ fn draw_splash(frame: &mut Frame, app: &App) {
     );
 }
 
-fn draw(frame: &mut Frame, app: &App, log_h: usize) {
+fn draw(frame: &mut Frame, app: &App, log_h: usize, metrics: &MetricsSummary) {
     let [title_area, log_area, foot_area] = Layout::vertical([
         Constraint::Length(5),
         Constraint::Fill(1),
@@ -715,7 +979,6 @@ fn draw(frame: &mut Frame, app: &App, log_h: usize) {
             app.events.len()
         )
     };
-    let metrics = app.metrics.summary();
     let current = metrics.rates.last().copied().unwrap_or_default();
 
     // Messages-per-second series over the rate window. In is cyan and out is
@@ -867,9 +1130,22 @@ fn draw(frame: &mut Frame, app: &App, log_h: usize) {
         let s = app.scroll;
         (s, (s + log_h).min(app.visible.len()))
     };
+    let needle = app.search_text.to_lowercase();
     let mut lines: Vec<Line> = Vec::new();
     for &event_index in &app.visible[start..end] {
-        lines.extend(event_lines(&app.events[event_index], view));
+        let mut event_lines = event_lines(&app.events[event_index], view);
+        // Highlight lines of events matching the active search.
+        if !needle.is_empty()
+            && app.events[event_index]
+                .rendered()
+                .to_lowercase()
+                .contains(&needle)
+        {
+            for line in &mut event_lines {
+                line.style = line.style.bg(Color::Rgb(80, 70, 0));
+            }
+        }
+        lines.extend(event_lines);
     }
     let mut para = Paragraph::new(Text::from(lines)).block(log_block);
     if app.wrap {
@@ -882,6 +1158,15 @@ fn draw(frame: &mut Frame, app: &App, log_h: usize) {
     let off = Style::default();
     if app.command_editing {
         draw_command_bar(frame, app, foot_area);
+    } else if app.search_editing {
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![Span::styled(
+                format!(" search › {}█", app.search_text),
+                Style::default().fg(Color::Yellow),
+            )]))
+            .block(Block::bordered().title_top(" search · Enter next · Esc cancel ")),
+            foot_area,
+        );
     } else if app.filter_editing {
         let style = if app.filter_error.is_some() {
             Style::default().fg(Color::Red)
@@ -898,7 +1183,21 @@ fn draw(frame: &mut Frame, app: &App, log_h: usize) {
                 Span::styled(format!(" display filter › {}█", app.filter_text), style),
                 Span::styled(detail, Style::default().fg(Color::Red)),
             ]))
-            .block(Block::bordered().title_top(" display filter · Enter done · Esc clear ")),
+            .block(Block::bordered().title_top(" display filter · Enter apply · Esc cancel ")),
+            foot_area,
+        );
+    } else if !app.search_text.is_empty() {
+        // An active search: show the term and match count with n/N hint.
+        let count = app.search_matches().len();
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    format!(" search: {} ", app.search_text),
+                    Style::default().fg(Color::Yellow).bold(),
+                ),
+                Span::raw(format!("· {count} matches · n/N next/prev · Esc clear")),
+            ]))
+            .block(Block::bordered()),
             foot_area,
         );
     } else if let Some((notice, is_error)) = &app.command_notice {
@@ -907,7 +1206,7 @@ fn draw(frame: &mut Frame, app: &App, log_h: usize) {
                 format!(" {notice}"),
                 Style::default().fg(if *is_error { Color::Red } else { Color::Green }),
             ))
-            .block(Block::bordered().title_top(" status · / command ")),
+            .block(Block::bordered().title_top(" status · : command ")),
             foot_area,
         );
     } else {
@@ -923,7 +1222,7 @@ fn draw(frame: &mut Frame, app: &App, log_h: usize) {
                 "display filter",
                 if app.filter.is_empty() { off } else { on },
             ),
-            Span::raw(" · / command · c clear "),
+            Span::raw(" · / search · : command · c clear "),
         ];
         frame.render_widget(
             Paragraph::new(Line::from(footer)).block(Block::bordered()),
@@ -1028,6 +1327,7 @@ fn view_window(
         }
         (start, n)
     } else {
+        // Forward-fill from the anchor.
         let mut end = scroll;
         for (i, &event_index) in visible.iter().enumerate().skip(scroll) {
             let h = event_height(&events[event_index], width, view);
@@ -1040,7 +1340,22 @@ fn view_window(
                 break;
             }
         }
-        (scroll, end)
+        // If the forward fill hit the end without filling the viewport, back-fill
+        // so the window stays full. Without this, leaving follow near the bottom
+        // (a single tall rich/wrapped item as the anchor) collapses the view to a
+        // couple of rows with blank space below.
+        let mut start = scroll;
+        if end == n && rows < log_h {
+            for (i, &event_index) in visible.iter().take(scroll).enumerate().rev() {
+                let h = event_height(&events[event_index], width, view);
+                if rows + h > log_h {
+                    break;
+                }
+                rows += h;
+                start = i;
+            }
+        }
+        (start, end)
     }
 }
 
@@ -1489,7 +1804,7 @@ mod tests {
     }
 
     #[test]
-    fn y_opens_editor_and_escape_clears_startup_display_filter() {
+    fn y_opens_editor_and_escape_cancels_edit_restoring_filter() {
         let (_tx, rx) = crossbeam_channel::unbounded();
         let mut app = App::new(
             rx,
@@ -1503,6 +1818,8 @@ mod tests {
         app.push_output(message("DataRow", "{ id=1 }", 40005));
         assert_eq!(app.visible, vec![0]);
 
+        // Open the editor, type a partial edit, then Esc: the edit is abandoned
+        // and the previously-applied filter is restored (not wiped).
         handle_key(
             &mut app,
             10,
@@ -1512,17 +1829,102 @@ mod tests {
         handle_key(
             &mut app,
             10,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+        );
+        handle_key(
+            &mut app,
+            10,
             KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
         );
 
         assert!(!app.filter_editing);
+        assert!(
+            !app.filter.is_empty(),
+            "Esc must not wipe the applied filter"
+        );
+        assert_eq!(app.filter_text, "message.type == \"Query\"");
+        assert_eq!(app.visible, vec![0]);
+
+        // A second Esc in normal mode clears the applied filter (documented).
+        handle_key(
+            &mut app,
+            10,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        );
         assert!(app.filter.is_empty());
-        assert!(app.filter_text.is_empty());
         assert_eq!(app.visible, vec![0, 1]);
     }
 
     #[test]
-    fn slash_opens_command_bar_without_touching_display_filter() {
+    fn filter_applies_on_enter_not_per_keystroke() {
+        let mut app = app();
+        app.push_output(message("Query", "SELECT 1", 40005));
+        app.push_output(message("DataRow", "{ id=1 }", 40005));
+
+        handle_key(
+            &mut app,
+            10,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+        );
+        for ch in "message.type == \"Query\"".chars() {
+            handle_key(
+                &mut app,
+                10,
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+            );
+        }
+        // Still unapplied while typing (both events visible).
+        assert_eq!(app.visible, vec![0, 1]);
+        handle_key(
+            &mut app,
+            10,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(!app.filter_editing);
+        assert_eq!(app.visible, vec![0]);
+    }
+
+    #[test]
+    fn clear_counts_dropped_and_resets_scroll() {
+        let mut app = app();
+        app.push_output(message("Query", "SELECT 1", 40005));
+        app.push_output(message("Query", "SELECT 2", 40005));
+        app.scroll = 1;
+        handle_key(
+            &mut app,
+            10,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+        );
+        assert!(app.events.is_empty());
+        assert_eq!(app.scroll, 0);
+        assert_eq!(
+            app.dropped_events, 2,
+            "cleared events are counted as dropped"
+        );
+    }
+
+    #[test]
+    fn trim_history_preserves_scroll_position() {
+        let mut app = app();
+        for i in 0..(HISTORY_CAP + HISTORY_TRIM_CHUNK) {
+            app.push_output(message("Query", &format!("q{i}"), 40005));
+        }
+        // Sitting partway up the (now trimmed) buffer, not at the top.
+        app.follow = false;
+        app.scroll = 100;
+        let before = app.scroll;
+        app.push_output(message("Query", "trigger-trim", 40005));
+        app.trim_history();
+        // Scroll shifted with the evicted prefix, not reset to 0.
+        assert!(
+            app.scroll < before && app.scroll > 0,
+            "scroll: {}",
+            app.scroll
+        );
+    }
+
+    #[test]
+    fn colon_opens_command_bar_and_slash_opens_search() {
         let (_tx, rx) = crossbeam_channel::unbounded();
         let mut app = App::new(
             rx,
@@ -1533,14 +1935,90 @@ mod tests {
             Vec::new(),
         );
 
+        // ':' opens the command bar (not the display filter editor).
+        handle_key(
+            &mut app,
+            10,
+            KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE),
+        );
+        assert!(!app.filter_editing);
+        assert!(app.command_editing);
+        handle_key(
+            &mut app,
+            10,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        );
+
+        // '/' opens text search, not the command bar.
         handle_key(
             &mut app,
             10,
             KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
         );
+        assert!(app.search_editing);
+        assert!(!app.command_editing);
+    }
 
-        assert!(!app.filter_editing);
-        assert!(app.command_editing);
+    #[test]
+    fn search_jumps_to_and_navigates_matches() {
+        let mut app = app();
+        app.push_output(message("Query", "SELECT * FROM users", 40005)); // 0
+        app.push_output(message("Query", "SELECT * FROM orders", 40005)); // 1
+        app.push_output(message("Query", "SELECT * FROM users2", 40005)); // 2
+        app.follow = false;
+        app.scroll = 0;
+
+        // '/' opens search; type "orders" and Enter: jump to the match at pos 1.
+        handle_key(
+            &mut app,
+            10,
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+        );
+        assert!(app.search_editing);
+        for ch in "orders".chars() {
+            handle_key(
+                &mut app,
+                10,
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+            );
+        }
+        handle_key(
+            &mut app,
+            10,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(!app.search_editing);
+        assert_eq!(app.scroll, 1);
+
+        // Search "users" -> matches positions 0 and 2; n/N cycle between them.
+        app.search_text = "users".into();
+        app.scroll = 0;
+        handle_key(
+            &mut app,
+            10,
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+        );
+        assert_eq!(app.scroll, 2, "n goes to next match after anchor 0");
+        handle_key(
+            &mut app,
+            10,
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+        );
+        assert_eq!(app.scroll, 0, "n wraps to the first match");
+        handle_key(
+            &mut app,
+            10,
+            KeyEvent::new(KeyCode::Char('N'), KeyModifiers::NONE),
+        );
+        assert_eq!(app.scroll, 2, "N wraps back to the last match");
+
+        // Esc clears the active search.
+        handle_key(
+            &mut app,
+            10,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        );
+        assert!(app.search_text.is_empty());
     }
 
     #[test]
@@ -1638,7 +2116,7 @@ mod tests {
         assert!(app.show_splash);
         // Startup status lines do not count as traffic.
         app.push_output(Output::Status("tapgres: capturing on 'lo'".into()));
-        app.leave_splash_if_traffic();
+        app.leave_splash_if_traffic(0);
         assert!(app.show_splash, "status lines must not leave the splash");
     }
 
@@ -1662,7 +2140,8 @@ mod tests {
             "127.0.0.1:5432".parse().unwrap(),
             false,
         );
-        app.leave_splash_if_traffic();
+        let opened = app.metrics.summary().conns_opened;
+        app.leave_splash_if_traffic(opened);
         assert!(
             !app.show_splash,
             "an opened connection must leave the splash"

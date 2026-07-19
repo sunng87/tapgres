@@ -4,20 +4,33 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    # Weekly security audit (see the `audit` job; the other jobs skip
+    # scheduled runs).
+    - cron: "0 4 * * 1"
 
 # Cancel in-progress runs for the same ref when new commits are pushed.
+# `event_name` is part of the group so the weekly scheduled audit never
+# cancels (or is cancelled by) an in-flight push run on main.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   rust:
-    name: Rust (fmt, clippy, test)
-    runs-on: ubuntu-latest
+    name: Rust (fmt, clippy, test) / ${{ matrix.os }}
+    if: github.event_name != 'schedule'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v7
 
+      # libpcap ships with macOS, so only the Linux runner needs an install.
       - name: Install libpcap (for the `pcap` crate)
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y libpcap-dev
@@ -35,8 +48,45 @@ jobs:
       - name: cargo test
         run: cargo test --all
 
+  msrv:
+    # Matches `rust-version` in Cargo.toml. Bump both together.
+    name: MSRV (Rust 1.85)
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install libpcap (for the `pcap` crate)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpcap-dev
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.85"
+
+      - name: cargo check
+        run: cargo check --all-targets --locked
+
+  audit:
+    # Runs on pull requests and pushes, plus a weekly scheduled sweep so new
+    # RUSTSEC advisories against pinned deps are caught between commits.
+    name: Security audit (cargo audit)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      checks: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
   nix:
     name: Nix (build)
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
