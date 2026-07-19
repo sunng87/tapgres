@@ -1,25 +1,43 @@
+# -----------------------------------------------------------------------------
+# TEMPLATE — DO NOT PUBLISH AS-IS.
+#
+# pkgver and the sha256sums* arrays below are placeholders. At release time
+# .github/workflows/release.yml rewrites them with sed (pkgver from the tag,
+# checksums from the freshly built release assets) before pushing to the AUR.
+# pkgver=0.0.0 is deliberate, to make the template nature obvious.
+# -----------------------------------------------------------------------------
 # Maintainer: Ning Sun <n@sunng.info>
 pkgname=tapgres-bin
-pkgver=0.1.0
+pkgver=0.0.0
 pkgrel=1
 pkgdesc="Passively tap a local PostgreSQL port and decode its wire traffic to stdout"
-arch=('x86_64')
+arch=('x86_64' 'aarch64')
 url="https://github.com/sunng87/tapgres"
 provides=('tapgres')
 conflicts=('tapgres')
 license=('MIT')
 depends=('glibc' 'gcc-libs' 'libpcap')
 makedepends=('patchelf')
-source=("$pkgname-$pkgver::https://github.com/sunng87/tapgres/releases/download/v${pkgver}/tapgres-linux-x86_64"
-        "tapgres-$pkgver.1.gz::https://github.com/sunng87/tapgres/releases/download/v${pkgver}/tapgres.1.gz")
-sha256sums=('SKIP' 'SKIP') # Replaced with the real checksums by the release workflow
+# The manpage is a shared (arch-independent) source; the prebuilt binary is
+# arch-specific. The release publishes tapgres-linux-x86_64 (nix-built) and
+# tapgres-linux-aarch64 (plain cargo build on GitHub's arm64 runner).
+source=("tapgres-$pkgver.1.gz::https://github.com/sunng87/tapgres/releases/download/v${pkgver}/tapgres.1.gz")
+source_x86_64=("$pkgname-$pkgver::https://github.com/sunng87/tapgres/releases/download/v${pkgver}/tapgres-linux-x86_64")
+source_aarch64=("$pkgname-$pkgver::https://github.com/sunng87/tapgres/releases/download/v${pkgver}/tapgres-linux-aarch64")
+sha256sums=('SKIP')         # Replaced with the real checksum by the release workflow
+sha256sums_x86_64=('SKIP')  # Replaced with the real checksum by the release workflow
+sha256sums_aarch64=('SKIP') # Replaced with the real checksum by the release workflow
 
 package() {
-  # The binary is produced by `nix build`, so its ELF interpreter and RUNPATH
-  # point into /nix/store. Repoint the interpreter to Arch's dynamic loader and
-  # drop the nix RUNPATH so libpcap.so.1 resolves from the system (/usr/lib).
-  patchelf --set-interpreter /usr/lib/ld-linux-x86-64.so.2 "$srcdir/$pkgname-$pkgver"
-  patchelf --remove-rpath "$srcdir/$pkgname-$pkgver"
+  if [[ $CARCH == x86_64 ]]; then
+    # The x86_64 binary is produced by `nix build`, so its ELF interpreter and
+    # RUNPATH point into /nix/store. Repoint the interpreter to Arch's dynamic
+    # loader and drop the nix RUNPATH so libpcap.so.1 resolves from the system
+    # (/usr/lib). The aarch64 binary is a plain cargo build on a GitHub arm64
+    # runner and already uses the standard interpreter and no baked RUNPATH.
+    patchelf --set-interpreter /usr/lib/ld-linux-x86-64.so.2 "$srcdir/$pkgname-$pkgver"
+    patchelf --remove-rpath "$srcdir/$pkgname-$pkgver"
+  fi
   install -Dm755 "$srcdir/$pkgname-$pkgver" "$pkgdir/usr/bin/tapgres"
   install -Dm644 "$srcdir/tapgres-$pkgver.1.gz" "$pkgdir/usr/share/man/man1/tapgres.1.gz"
 }

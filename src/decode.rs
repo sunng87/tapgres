@@ -7,12 +7,13 @@
 
 use std::cell::RefCell;
 use std::fmt::Write as _;
-use std::sync::Mutex;
+use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use crossbeam_channel::Sender;
+use crossbeam_channel::{Receiver, Sender};
 
 use bytes::{Buf, Bytes};
-use chrono::Local;
+use chrono::{Local, SecondsFormat};
 
 use crate::filter::{DisplayFilter, DisplayMessage, MessageDirection};
 use crate::flow::{Direction, Role};
@@ -134,20 +135,42 @@ impl Output {
     }
 }
 
+/// Capacity of the output channel. Large enough that ordinary bursts never
+/// stall, but bounded: a wedged consumer (a paused stdout pager, a stalled
+/// `--save` disk) then sheds records instead of growing memory without limit or
+/// — critically for mitm mode — stalling the client↔server relay it sits in.
+pub const OUTPUT_CHANNEL_CAPACITY: usize = 131_072;
+
 /// The global producer handle. `None` (the default) means no consumer is wired
-/// and `out`/`status` print directly to stdout/stderr.
-static OUTPUT_TX: Mutex<Option<Sender<Output>>> = Mutex::new(None);
+/// and `out`/`status` print directly to stdout/stderr. An `RwLock` (not a
+/// `Mutex`) so the many concurrent mitm pump tasks don't serialize on the read
+/// path — only `set_output`/`close_output` take the write lock.
+static OUTPUT_TX: RwLock<Option<Sender<Output>>> = RwLock::new(None);
+
+/// Count of records shed because the consumer could not keep up.
+static DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Create the bounded output channel. Both the stdout printer and the TUI use
+/// this so the backpressure policy is identical.
+pub fn channel() -> (Sender<Output>, Receiver<Output>) {
+    crossbeam_channel::bounded(OUTPUT_CHANNEL_CAPACITY)
+}
+
+/// How many output records have been dropped because the consumer fell behind.
+pub fn dropped_count() -> u64 {
+    DROPPED.load(Ordering::Relaxed)
+}
 
 /// Install the channel producers write to. The matching receiver is owned by
 /// whichever consumer is active (stdout-printer thread, or the TUI).
 pub fn set_output(tx: Sender<Output>) {
-    *OUTPUT_TX.lock().unwrap() = Some(tx);
+    *OUTPUT_TX.write().unwrap() = Some(tx);
 }
 
 /// Drop the producer handle so the consumer observes end-of-stream and can
 /// flush/drain.
 pub fn close_output() {
-    *OUTPUT_TX.lock().unwrap() = None;
+    *OUTPUT_TX.write().unwrap() = None;
 }
 
 fn deliver(record: Output) {
@@ -157,8 +180,12 @@ fn deliver(record: Output) {
         CAPTURE.with(|c| c.borrow_mut().as_mut().unwrap().push(record));
         return;
     }
-    if let Some(tx) = &*OUTPUT_TX.lock().unwrap() {
-        let _ = tx.send(record); // unbounded channel: never blocks
+    if let Some(tx) = &*OUTPUT_TX.read().unwrap() {
+        // Non-blocking: never stall the capture thread or the mitm relay. If the
+        // consumer is too far behind, shed this record and count it.
+        if tx.try_send(record).is_err() {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+        }
         return;
     }
     // No consumer wired: fall back to direct terminal output.
@@ -167,6 +194,13 @@ fn deliver(record: Output) {
         Output::Line(s) => println!("{s}"),
         Output::Status(s) => eprintln!("{s}"),
     }
+}
+
+/// Feed a previously decoded record through the active consumer. File replay
+/// uses this entry point so it follows the exact same stdout/TUI path as live
+/// capture without exposing the decoder's routing internals.
+pub fn replay(record: Output) {
+    deliver(record);
 }
 
 /// Emit one decoded protocol line. Routed to the output consumer, or stdout if
@@ -224,13 +258,17 @@ impl MessageEmitter {
     }
 
     fn emit_with_detail(self, kind: &str, text: &str, detail: Option<EventDetail>) {
+        let captured_at = Local::now();
+        let timestamp = captured_at.to_rfc3339_opts(SecondsFormat::Millis, true);
+        let display_time = captured_at.format("%H:%M:%S%.3f");
         let rendered = if text.is_empty() {
-            format!("[{}] [{}] {}", ts(), dir_tag(self.role), kind)
+            format!("[{display_time}] [{}] {kind}", dir_tag(self.role))
         } else {
-            format!("[{}] [{}] {}: {}", ts(), dir_tag(self.role), kind, text)
+            format!("[{display_time}] [{}] {kind}: {text}", dir_tag(self.role))
         };
         deliver(Output::Message {
             message: DisplayMessage {
+                timestamp,
                 rendered,
                 client: self.client,
                 direction: if self.role == Role::Client {
@@ -246,9 +284,13 @@ impl MessageEmitter {
     }
 
     fn warn(self, msg: &str) {
-        let rendered = format!("[{}] [{}] ⚠ {}", ts(), dir_tag(self.role), msg);
+        let captured_at = Local::now();
+        let timestamp = captured_at.to_rfc3339_opts(SecondsFormat::Millis, true);
+        let display_time = captured_at.format("%H:%M:%S%.3f");
+        let rendered = format!("[{display_time}] [{}] ⚠ {msg}", dir_tag(self.role));
         deliver(Output::Message {
             message: DisplayMessage {
+                timestamp,
                 rendered,
                 client: self.client,
                 direction: if self.role == Role::Client {
@@ -262,6 +304,13 @@ impl MessageEmitter {
             detail: None,
         });
     }
+}
+
+/// Emit a warning line attributed to a connection direction. Used by the
+/// reassembly layer (which has no `MessageEmitter`) to report lost or skipped
+/// bytes so the warning is filterable and TUI-attributed like decoded messages.
+pub fn warn(role: Role, client: std::net::SocketAddr, msg: &str) {
+    MessageEmitter { role, client }.warn(msg);
 }
 
 /// Signal that the *server* side should now expect a 1-byte SSL or GSS
@@ -302,7 +351,7 @@ pub struct DrainOutcome {
 /// See [`ServerNegotiationWait`] and [`DrainOutcome`] for how the caller learns
 /// about the SSL/GSS negotiation handoff and encryption.
 pub fn drain_direction(dir: &mut Direction, outcome: &mut DrainOutcome) {
-    if outcome.encrypted {
+    if outcome.encrypted || dir.dead {
         return;
     }
     if dir.role == Role::Client {
@@ -311,13 +360,14 @@ pub fn drain_direction(dir: &mut Direction, outcome: &mut DrainOutcome) {
             match PgWireFrontendMessage::decode(&mut dir.rxbuf, &dir.ctx) {
                 Ok(None) => return,
                 Ok(Some(msg)) => {
+                    dir.decode_failures = 0; // progress: the stream is in sync
                     let consumed = before.saturating_sub(dir.rxbuf.len()) as u64;
                     if !handle_frontend(dir, msg, outcome, consumed) {
                         return;
                     }
                 }
                 Err(e) => {
-                    decode_error(Role::Client, &e, &mut dir.rxbuf);
+                    decode_error(dir, &e);
                     return;
                 }
             }
@@ -328,11 +378,12 @@ pub fn drain_direction(dir: &mut Direction, outcome: &mut DrainOutcome) {
             match PgWireBackendMessage::decode(&mut dir.rxbuf, &dir.ctx) {
                 Ok(None) => return,
                 Ok(Some(msg)) => {
+                    dir.decode_failures = 0;
                     let consumed = before.saturating_sub(dir.rxbuf.len()) as u64;
                     handle_backend(dir, msg, outcome, consumed);
                 }
                 Err(e) => {
-                    decode_error(Role::Server, &e, &mut dir.rxbuf);
+                    decode_error(dir, &e);
                     return;
                 }
             }
@@ -340,24 +391,30 @@ pub fn drain_direction(dir: &mut Direction, outcome: &mut DrainOutcome) {
     }
 }
 
-fn decode_error(role: Role, e: &pgwire::error::PgWireError, buf: &mut bytes::BytesMut) {
-    // The buffer is out of sync with the protocol; rather than crash, report and
-    // drop the remainder so a later, well-formed message can still be seen.
-    out(format!(
-        "[{}] [{}] ⚠ decode error ({} lost bytes): {}",
-        role_dbg(role),
-        dir_tag(role),
-        buf.len(),
-        e
-    ));
-    buf.clear();
-}
+/// Give up on a direction after this many consecutive decode failures. Occasional
+/// failures recover (a resync gap, capture joined mid-message); a persistent run
+/// means the stream is desynced and every future segment starts mid-message.
+const MAX_DECODE_FAILURES: u32 = 8;
 
-fn role_dbg(role: Role) -> &'static str {
-    if role == Role::Client {
-        "client"
+fn decode_error(dir: &mut Direction, e: &pgwire::error::PgWireError) {
+    // The buffer is out of sync with the protocol; rather than crash, report and
+    // drop the remainder so a later, well-formed message can still be seen. The
+    // warning is emitted as an attributed message (not a bare line) so it shares
+    // the client/direction metadata and honors display filters.
+    let lost = dir.rxbuf.len();
+    dir.rxbuf.clear();
+    dir.decode_failures += 1;
+    let emitter = MessageEmitter {
+        role: dir.role,
+        client: dir.client,
+    };
+    if dir.decode_failures >= MAX_DECODE_FAILURES {
+        dir.dead = true;
+        emitter.warn(&format!(
+            "decode error ({lost} lost bytes): {e}; stream desynced, giving up decoding this direction"
+        ));
     } else {
-        "server"
+        emitter.warn(&format!("decode error ({lost} lost bytes): {e}"));
     }
 }
 
@@ -414,19 +471,52 @@ fn handle_frontend(
             dir.ctx.awaiting_frontend_startup = false;
             emitter.emit("Startup", &format_startup(&s));
         }
-        PgWireFrontendMessage::CancelRequest(_) => {
-            emitter.emit("CancelRequest", "");
+        PgWireFrontendMessage::CancelRequest(c) => {
+            emitter.emit("CancelRequest", &format_cancel(&c));
         }
         PgWireFrontendMessage::Query(q) => {
             emitter.emit("Query", &query_text(&q));
         }
-        PgWireFrontendMessage::Parse(p) => emitter.emit("Parse", &format_parse(&p)),
-        PgWireFrontendMessage::Bind(b) => emitter.emit("Bind", &format_bind(&b)),
+        PgWireFrontendMessage::Parse(p) => {
+            // Remember the statement's SQL so later Bind/Execute can show it.
+            // Bounded so a connection that churns distinct statement names can't
+            // grow the map without limit.
+            if dir.prepared.len() < PREPARED_CACHE_CAP {
+                dir.prepared
+                    .insert(p.name.clone().unwrap_or_default(), p.query.clone());
+            }
+            emitter.emit("Parse", &format_parse(&p))
+        }
+        PgWireFrontendMessage::Bind(b) => {
+            dir.portals.insert(
+                b.portal_name.clone().unwrap_or_default(),
+                b.statement_name.clone().unwrap_or_default(),
+            );
+            let sql = dir.prepared.get(b.statement_name.as_deref().unwrap_or(""));
+            emitter.emit("Bind", &format_bind(&b, sql.map(String::as_str)))
+        }
         PgWireFrontendMessage::Describe(d) => {
             emitter.emit("Describe", &format_describe_close(d.target_type, &d.name))
         }
-        PgWireFrontendMessage::Execute(e) => emitter.emit("Execute", &format_execute(&e)),
+        PgWireFrontendMessage::Execute(e) => {
+            // Resolve portal → statement → SQL.
+            let sql = dir
+                .portals
+                .get(e.name.as_deref().unwrap_or(""))
+                .and_then(|stmt| dir.prepared.get(stmt));
+            emitter.emit("Execute", &format_execute(&e, sql.map(String::as_str)))
+        }
         PgWireFrontendMessage::Close(c) => {
+            // Drop the closed statement/portal so its SQL doesn't linger.
+            match c.target_type {
+                b'S' => {
+                    dir.prepared.remove(c.name.as_deref().unwrap_or(""));
+                }
+                b'P' => {
+                    dir.portals.remove(c.name.as_deref().unwrap_or(""));
+                }
+                _ => {}
+            }
             emitter.emit("Close", &format_describe_close(c.target_type, &c.name))
         }
         PgWireFrontendMessage::Sync(_) => emitter.emit("Sync", ""),
@@ -492,6 +582,13 @@ fn handle_backend(
             // in the extended protocol a statement/portal is described once but
             // may be executed across many ReadyForQuery cycles, so the columns
             // must outlive a single command cycle.
+            //
+            // Known limitation: one cache per direction. Two portals with
+            // different result shapes executed alternately would label each
+            // other's `DataRow`s. Correct labelling needs a per-portal map keyed
+            // off the request pipeline; the single cache is a deliberate
+            // simplification that is correct for the common one-portal-at-a-time
+            // case.
             dir.row_desc = Some(summary);
         }
         PgWireBackendMessage::NoData(_) => {
@@ -599,7 +696,11 @@ fn format_parse(p: &Parse) -> String {
     format!("{}  [param types: {}]  {}", name, types, p.query)
 }
 
-fn format_bind(b: &Bind) -> String {
+/// Cap on remembered prepared statements per direction; guards against a
+/// connection that never closes its statements from growing the cache forever.
+const PREPARED_CACHE_CAP: usize = 4096;
+
+fn format_bind(b: &Bind, sql: Option<&str>) -> String {
     let portal = b.portal_name.as_deref().unwrap_or("<unnamed>");
     let stmt = b.statement_name.as_deref().unwrap_or("<unnamed>");
     let all_text = b
@@ -627,13 +728,17 @@ fn format_bind(b: &Bind) -> String {
             }
         })
         .collect();
-    format!(
+    let mut out = format!(
         "{}  <-  {}  params: [{}]  result: {}",
         portal,
         stmt,
         params.join(", "),
         format_format_codes(&b.result_column_format_codes),
-    )
+    );
+    if let Some(sql) = sql {
+        let _ = write!(out, "  sql: {sql}");
+    }
+    out
 }
 
 /// Render format codes (text=0, binary=1) compactly: `text`, `binary`, or a
@@ -667,13 +772,21 @@ fn format_describe_close(target_type: u8, name: &Option<String>) -> String {
     format!("{} {}", kind, name.as_deref().unwrap_or("<unnamed>"))
 }
 
-fn format_execute(e: &Execute) -> String {
+fn format_execute(e: &Execute, sql: Option<&str>) -> String {
     let name = e.name.as_deref().unwrap_or("<unnamed>");
-    if e.max_rows == 0 {
+    let mut out = if e.max_rows == 0 {
         name.to_string()
     } else {
         format!("{} (limit {})", name, e.max_rows)
+    };
+    if let Some(sql) = sql {
+        let _ = write!(out, "  sql: {sql}");
     }
+    out
+}
+
+fn format_cancel(c: &pgwire::messages::cancel::CancelRequest) -> String {
+    format!("pid={} key={}", c.pid, secret_key_str(&c.secret_key))
 }
 
 fn format_auth(a: &Authentication) -> String {
@@ -689,12 +802,15 @@ fn format_auth(a: &Authentication) -> String {
     }
 }
 
-fn format_bkd(b: &BackendKeyData) -> String {
-    let key = match &b.secret_key {
+fn secret_key_str(key: &SecretKey) -> String {
+    match key {
         SecretKey::I32(i) => i.to_string(),
         SecretKey::Bytes(bs) => hex_preview(bs),
-    };
-    format!("pid={} key={}", b.pid, key)
+    }
+}
+
+fn format_bkd(b: &BackendKeyData) -> String {
+    format!("pid={} key={}", b.pid, secret_key_str(&b.secret_key))
 }
 
 fn format_negotiate(n: &NegotiateProtocolVersion) -> String {
@@ -899,7 +1015,18 @@ fn hex_preview(b: &[u8]) -> String {
 
 fn format_bytes(b: &Bytes) -> String {
     if is_printable(b) {
-        String::from_utf8_lossy(b).into_owned()
+        // A bulk COPY streams whole chunks through here; cap the printable
+        // preview like the hex path so one CopyData can't emit a multi-MB line.
+        const MAX: usize = 256;
+        if b.len() > MAX {
+            format!(
+                "{}… ({} bytes)",
+                String::from_utf8_lossy(&b[..MAX]),
+                b.len()
+            )
+        } else {
+            String::from_utf8_lossy(b).into_owned()
+        }
     } else {
         hex_preview(b)
     }
@@ -1008,6 +1135,91 @@ mod tests {
     }
 
     #[test]
+    fn bind_and_execute_resolve_prepared_sql() {
+        let bind = Bind::new(Some("p1".into()), Some("s1".into()), vec![], vec![], vec![]);
+        let sql = "SELECT id FROM users WHERE tenant = $1";
+        assert!(format_bind(&bind, Some(sql)).contains(sql));
+        assert!(!format_bind(&bind, None).contains("sql:"));
+
+        let exec = Execute::new(Some("p1".into()), 0);
+        assert!(format_execute(&exec, Some(sql)).contains(sql));
+        assert_eq!(format_execute(&exec, None), "p1");
+    }
+
+    #[test]
+    fn parse_then_execute_end_to_end_shows_sql() {
+        use crate::flow::Direction;
+        start_capture();
+        let mut dir = Direction::for_decoding(Role::Client, "127.0.0.1:40000".parse().unwrap());
+        let mut outcome = DrainOutcome::default();
+        let sql = "SELECT * FROM orders WHERE id = $1";
+        // Parse s1, Bind p1<-s1, Execute p1 — driven directly through the handler.
+        handle_frontend(
+            &mut dir,
+            PgWireFrontendMessage::Parse(Parse::new(Some("s1".into()), sql.into(), vec![])),
+            &mut outcome,
+            0,
+        );
+        handle_frontend(
+            &mut dir,
+            PgWireFrontendMessage::Bind(Bind::new(
+                Some("p1".into()),
+                Some("s1".into()),
+                vec![],
+                vec![],
+                vec![],
+            )),
+            &mut outcome,
+            0,
+        );
+        handle_frontend(
+            &mut dir,
+            PgWireFrontendMessage::Execute(Execute::new(Some("p1".into()), 0)),
+            &mut outcome,
+            0,
+        );
+        let out = take_output_capture();
+        let execute = out
+            .iter()
+            .find_map(|o| match o {
+                Output::Message { message, .. } if message.kind == "Execute" => Some(message),
+                _ => None,
+            })
+            .expect("an Execute message");
+        assert!(
+            execute.text.contains(sql),
+            "Execute should resolve to its SQL"
+        );
+    }
+
+    #[test]
+    fn printable_payload_preview_is_truncated() {
+        let big = Bytes::from(vec![b'x'; 5000]);
+        let rendered = format_bytes(&big);
+        assert!(rendered.len() < 400, "preview must be capped");
+        assert!(rendered.contains("(5000 bytes)"));
+    }
+
+    #[test]
+    fn persistent_decode_failures_mark_direction_dead() {
+        use crate::flow::Direction;
+        start_capture();
+        let mut dir = Direction::for_decoding(Role::Server, "127.0.0.1:40000".parse().unwrap());
+        // Feed junk that never decodes; each drain fails and clears the buffer.
+        for _ in 0..MAX_DECODE_FAILURES {
+            dir.rxbuf.extend_from_slice(&[0xff, 0xff, 0xff, 0xff, 0xff]);
+            let mut outcome = DrainOutcome::default();
+            drain_direction(&mut dir, &mut outcome);
+        }
+        assert!(dir.dead, "should give up after repeated failures");
+        // Once dead, further drains are a no-op even with fresh bytes.
+        dir.rxbuf.extend_from_slice(&[0xff; 5]);
+        let mut outcome = DrainOutcome::default();
+        drain_direction(&mut dir, &mut outcome);
+        let _ = take_output_capture();
+    }
+
+    #[test]
     fn decoded_output_carries_filter_metadata() {
         start_capture();
         MessageEmitter {
@@ -1039,6 +1251,7 @@ mod tests {
                 .unwrap();
         let query = Output::Message {
             message: DisplayMessage {
+                timestamp: "2026-07-17T12:34:56.789+01:00".into(),
                 rendered: "query".into(),
                 client: "127.0.0.1:40005".parse().unwrap(),
                 direction: MessageDirection::FrontendToBackend,
@@ -1049,6 +1262,7 @@ mod tests {
         };
         let row = Output::Message {
             message: DisplayMessage {
+                timestamp: "2026-07-17T12:34:56.789+01:00".into(),
                 rendered: "row".into(),
                 client: "127.0.0.1:40005".parse().unwrap(),
                 direction: MessageDirection::BackendToFrontend,

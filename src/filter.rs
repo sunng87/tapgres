@@ -6,9 +6,13 @@
 //!
 //! ```text
 //! client.ip == 127.0.0.1 and client.port == 40005
+//! client.port >= 40000 and client.port < 50000
 //! message.type in {"Query", "DataRow"} and message.text contains "orders"
 //! not (message.direction == "b2f" or message.type matches r"^Error")
 //! ```
+//!
+//! Ordered comparisons (`<`, `<=`, `>`, `>=`) apply to the numeric
+//! `client.port` field only.
 
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
@@ -25,6 +29,9 @@ pub enum MessageDirection {
 /// A decoded message plus the structured fields used by display filters.
 #[derive(Clone, Debug)]
 pub struct DisplayMessage {
+    /// Original capture time in RFC 3339 with millisecond precision. Kept
+    /// separately from `rendered` so saved sessions preserve real timestamps.
+    pub timestamp: String,
     pub rendered: String,
     pub client: SocketAddr,
     pub direction: MessageDirection,
@@ -122,10 +129,32 @@ enum Value {
     Direction(MessageDirection),
 }
 
+/// Ordered comparison operator, for numeric fields (`client.port`).
+#[derive(Clone, Copy, Debug)]
+enum OrdOp {
+    Less,
+    LessEqual,
+    Greater,
+    GreaterEqual,
+}
+
+impl OrdOp {
+    fn test(self, actual: u16, bound: u16) -> bool {
+        match self {
+            Self::Less => actual < bound,
+            Self::LessEqual => actual <= bound,
+            Self::Greater => actual > bound,
+            Self::GreaterEqual => actual >= bound,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 enum Comparison {
     Equal(Value),
     NotEqual(Value),
+    /// An ordered comparison against a port number (`client.port > 40000`).
+    Ordered(OrdOp, u16),
     Contains(String),
     Matches(Regex),
     In(Vec<Value>),
@@ -142,6 +171,7 @@ impl Predicate {
         match &self.comparison {
             Comparison::Equal(value) => self.field.equals(value, message),
             Comparison::NotEqual(value) => !self.field.equals(value, message),
+            Comparison::Ordered(op, bound) => op.test(message.client.port(), *bound),
             Comparison::Contains(needle) => self
                 .field
                 .text(message)
@@ -221,6 +251,10 @@ enum TokenKind {
     String(String),
     Equal,
     NotEqual,
+    Less,
+    LessEqual,
+    Greater,
+    GreaterEqual,
     Contains,
     Matches,
     In,
@@ -285,6 +319,25 @@ fn lex(input: &str) -> Result<Vec<Token>, FilterParseError> {
             });
             continue;
         }
+        // Ordered comparisons (two-char forms before one-char).
+        for (symbol, kind) in [
+            ("<=", TokenKind::LessEqual),
+            (">=", TokenKind::GreaterEqual),
+            ("<", TokenKind::Less),
+            (">", TokenKind::Greater),
+        ] {
+            if input[start..].starts_with(symbol) {
+                position += symbol.len();
+                tokens.push(Token {
+                    kind: kind.clone(),
+                    position: start,
+                });
+                break;
+            }
+        }
+        if position != start {
+            continue;
+        }
         if input[start..].starts_with("&&") {
             position += 2;
             tokens.push(Token {
@@ -337,8 +390,14 @@ fn lex(input: &str) -> Result<Vec<Token>, FilterParseError> {
 
         while position < input.len() {
             let ch = input[position..].chars().next().unwrap();
+            // A quote or comparison operator ends the bare word, so
+            // `message.text contains"x"` and `client.port<40000` lex correctly
+            // instead of swallowing the operator into the field/word.
             if ch.is_whitespace()
-                || matches!(ch, '(' | ')' | '{' | '}' | ',' | '=' | '!' | '&' | '|')
+                || matches!(
+                    ch,
+                    '(' | ')' | '{' | '}' | ',' | '=' | '!' | '&' | '|' | '<' | '>' | '"'
+                )
             {
                 break;
             }
@@ -482,6 +541,27 @@ impl Parser {
         let comparison = match operator.kind {
             TokenKind::Equal => Comparison::Equal(self.parse_value(field)?),
             TokenKind::NotEqual => Comparison::NotEqual(self.parse_value(field)?),
+            TokenKind::Less
+            | TokenKind::LessEqual
+            | TokenKind::Greater
+            | TokenKind::GreaterEqual => {
+                let op = match operator.kind {
+                    TokenKind::Less => OrdOp::Less,
+                    TokenKind::LessEqual => OrdOp::LessEqual,
+                    TokenKind::Greater => OrdOp::Greater,
+                    _ => OrdOp::GreaterEqual,
+                };
+                if !matches!(field, Field::ClientPort) {
+                    return Err(FilterParseError::new(
+                        operator.position,
+                        format!(
+                            "ordered comparison is only valid for 'client.port', not '{}'",
+                            field.name()
+                        ),
+                    ));
+                }
+                Comparison::Ordered(op, self.parse_port()?)
+            }
             TokenKind::Contains => {
                 self.require_text_field(field, operator.position, "contains")?;
                 Comparison::Contains(self.parse_string("contains requires a quoted string")?)
@@ -503,7 +583,7 @@ impl Parser {
                 return Err(FilterParseError::new(
                     operator.position,
                     format!(
-                        "expected an operator after '{}' (==, !=, contains, matches, or in)",
+                        "expected an operator after '{}' (==, !=, <, <=, >, >=, contains, matches, or in)",
                         field.name()
                     ),
                 ));
@@ -550,12 +630,11 @@ impl Parser {
                 })
             }
             Field::ClientPort => {
-                let TokenKind::Word(value) = &token.kind else {
-                    return Err(FilterParseError::new(
-                        token.position,
-                        "client.port requires an integer",
-                    ));
-                };
+                // Accept both `client.port == 40005` and the quoted form
+                // `== "40005"`, mirroring client.ip's leniency.
+                let value = token_value(&token).ok_or_else(|| {
+                    FilterParseError::new(token.position, "client.port requires an integer")
+                })?;
                 value.parse().map(Value::Port).map_err(|_| {
                     FilterParseError::new(token.position, format!("invalid client port '{value}'"))
                 })
@@ -592,6 +671,17 @@ impl Parser {
             return Err(FilterParseError::new(token.position, error));
         };
         Ok(value)
+    }
+
+    /// Parse a port number (bare or quoted) for an ordered comparison.
+    fn parse_port(&mut self) -> Result<u16, FilterParseError> {
+        let token = self.take();
+        let value = token_value(&token).ok_or_else(|| {
+            FilterParseError::new(token.position, "expected a port number after the operator")
+        })?;
+        value.parse().map_err(|_| {
+            FilterParseError::new(token.position, format!("invalid client port '{value}'"))
+        })
     }
 
     fn require_text_field(
@@ -672,12 +762,63 @@ mod tests {
 
     fn message() -> DisplayMessage {
         DisplayMessage {
+            timestamp: "2026-07-17T12:34:56.789+01:00".into(),
             rendered: "line".into(),
             client: "127.0.0.1:40005".parse().unwrap(),
             direction: MessageDirection::FrontendToBackend,
             kind: "Query".into(),
             text: "SELECT * FROM orders WHERE id = 42".into(),
         }
+    }
+
+    #[test]
+    fn ordered_port_comparisons() {
+        // message() has client.port 40005.
+        for (expr, expected) in [
+            ("client.port > 40000", true),
+            ("client.port < 40000", false),
+            ("client.port >= 40005", true),
+            ("client.port <= 40005", true),
+            ("client.port < 40005", false),
+            ("client.port >= 40000 and client.port < 50000", true),
+        ] {
+            assert_eq!(
+                DisplayFilter::parse(expr).unwrap().matches(&message()),
+                expected,
+                "{expr}"
+            );
+        }
+        // Ordered comparison is rejected on non-numeric fields.
+        assert!(DisplayFilter::parse("message.type > \"Query\"").is_err());
+        assert!(DisplayFilter::parse("client.ip < 127.0.0.1").is_err());
+    }
+
+    #[test]
+    fn quoted_port_is_accepted_symmetrically_with_ip() {
+        // Both quoted and bare forms parse and match, like client.ip.
+        assert!(
+            DisplayFilter::parse("client.port == \"40005\"")
+                .unwrap()
+                .matches(&message())
+        );
+        assert!(
+            DisplayFilter::parse("client.port == 40005")
+                .unwrap()
+                .matches(&message())
+        );
+    }
+
+    #[test]
+    fn quote_terminates_a_bare_word() {
+        // `contains"orders"` (no space) must still recognise the operator.
+        let filter = DisplayFilter::parse("message.text contains\"orders\"").unwrap();
+        assert!(filter.matches(&message()));
+        // And a comparison operator glued to the field lexes correctly.
+        assert!(
+            DisplayFilter::parse("client.port<50000")
+                .unwrap()
+                .matches(&message())
+        );
     }
 
     #[test]
@@ -769,7 +910,7 @@ mod tests {
         let cases = [
             "client == 127.0.0.1",
             "client.ip contains \"127\"",
-            "client.port == \"40005\"",
+            "client.port == \"not-a-number\"",
             "message.type == Query",
             "message.direction == \"sideways\"",
             "message.type in {}",

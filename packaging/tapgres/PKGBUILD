@@ -1,6 +1,14 @@
+# -----------------------------------------------------------------------------
+# TEMPLATE — DO NOT PUBLISH AS-IS.
+#
+# pkgver and sha256sums below are placeholders. At release time
+# .github/workflows/release.yml rewrites them with sed (pkgver from the tag,
+# sha256sums from the source tarball) before pushing to the AUR.
+# pkgver=0.0.0 is deliberate, to make the template nature obvious.
+# -----------------------------------------------------------------------------
 # Maintainer: Ning Sun <n@sunng.info>
 pkgname=tapgres
-pkgver=0.1.0
+pkgver=0.0.0
 pkgrel=1
 pkgdesc="Passively tap a local PostgreSQL port and decode its wire traffic to stdout"
 arch=('x86_64' 'aarch64')

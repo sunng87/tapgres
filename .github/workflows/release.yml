@@ -5,11 +5,39 @@ on:
     tags:
       - "v*"
 
+permissions:
+  contents: read
+
 jobs:
-  build-and-release:
+  # Gate the release on the test suite so a tag never ships untested code.
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+
+      # libpcap ships with macOS, so only the Linux runners need an install.
+      - name: Install libpcap (for the `pcap` crate)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpcap-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: cargo test
+        run: cargo test --all --locked
+
+  # linux-x86_64 is nix-built (matching the AUR -bin package's patchelf
+  # expectations); the manpage is generated fresh by the nix build.
+  build-nix:
+    name: Build (linux-x86_64, nix)
+    needs: test
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@v7
 
@@ -29,12 +57,112 @@ jobs:
         # postInstall; copy it out of the nix output as a release asset.
         run: cp result/share/man/man1/tapgres.1.gz tapgres.1.gz
 
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tapgres-linux-x86_64
+          path: |
+            tapgres-linux-x86_64
+            tapgres.1.gz
+          if-no-files-found: error
+
+  # The remaining targets are plain cargo builds. macos-x86_64 is
+  # cross-compiled on the arm64 macOS runner (the Apple SDK ships both
+  # architectures, including libpcap).
+  build-cargo:
+    name: Build (${{ matrix.name }})
+    needs: test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-aarch64
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - name: macos-x86_64
+            os: macos-latest
+            target: x86_64-apple-darwin
+          - name: macos-arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install libpcap (for the `pcap` crate)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpcap-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: cargo build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Rename binary
+        run: cp "target/${{ matrix.target }}/release/tapgres" "tapgres-${{ matrix.name }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tapgres-${{ matrix.name }}
+          path: tapgres-${{ matrix.name }}
+          if-no-files-found: error
+
+  release:
+    name: Create release
+    needs: [build-nix, build-cargo]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    outputs:
+      version: ${{ steps.sha256.outputs.version }}
+      binary_x86_64: ${{ steps.sha256.outputs.binary_x86_64 }}
+      binary_aarch64: ${{ steps.sha256.outputs.binary_aarch64 }}
+      man: ${{ steps.sha256.outputs.man }}
+      source: ${{ steps.sha256.outputs.source }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        # Bare filenames so users can `sha256sum -c SHA256SUMS` next to the
+        # downloaded assets.
+        run: |
+          cd dist
+          sha256sum \
+            tapgres-linux-x86_64 \
+            tapgres-linux-aarch64 \
+            tapgres-macos-x86_64 \
+            tapgres-macos-arm64 \
+            tapgres.1.gz > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/tapgres-linux-x86_64
+            dist/tapgres-linux-aarch64
+            dist/tapgres-macos-x86_64
+            dist/tapgres-macos-arm64
+            dist/tapgres.1.gz
+
       - name: Create Release
         uses: softprops/action-gh-release@v3
         with:
           files: |
-            tapgres-linux-x86_64
-            tapgres.1.gz
+            dist/tapgres-linux-x86_64
+            dist/tapgres-linux-aarch64
+            dist/tapgres-macos-x86_64
+            dist/tapgres-macos-arm64
+            dist/tapgres.1.gz
+            dist/SHA256SUMS
           name: Release ${{ github.ref_name }}
           generate_release_notes: true
           draft: false
@@ -42,23 +170,40 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Get SHA256 checksums
+        # Consumed by the AUR deploy jobs below to fill in the PKGBUILD
+        # templates under packaging/.
         id: sha256
         run: |
           version=${GITHUB_REF_NAME#v}
-          binary_sha=$(sha256sum tapgres-linux-x86_64 | awk '{print $1}')
-          man_sha=$(sha256sum tapgres.1.gz | awk '{print $1}')
+          binary_x86_64_sha=$(sha256sum dist/tapgres-linux-x86_64 | awk '{print $1}')
+          binary_aarch64_sha=$(sha256sum dist/tapgres-linux-aarch64 | awk '{print $1}')
+          man_sha=$(sha256sum dist/tapgres.1.gz | awk '{print $1}')
           source_sha=$(curl -fsSL https://github.com/${{ github.repository }}/archive/refs/tags/${GITHUB_REF_NAME}.tar.gz | sha256sum | awk '{print $1}')
           {
             echo "version=$version"
-            echo "binary=$binary_sha"
+            echo "binary_x86_64=$binary_x86_64_sha"
+            echo "binary_aarch64=$binary_aarch64_sha"
             echo "man=$man_sha"
             echo "source=$source_sha"
           } >> "$GITHUB_OUTPUT"
 
+  # The AUR deploys are best-effort: a failed AUR push should never strand a
+  # half-done GitHub release, so both jobs are continue-on-error and can be
+  # redone by hand from the packaging/ templates if needed.
+  aur-bin:
+    name: Deploy tapgres-bin to AUR
+    needs: release
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+
       - name: Update tapgres-bin PKGBUILD
         run: |
-          sed -i "s/^pkgver=.*/pkgver=${{ steps.sha256.outputs.version }}/" packaging/tapgres-bin/PKGBUILD
-          sed -i "s/^sha256sums=.*/sha256sums=('${{ steps.sha256.outputs.binary }}' '${{ steps.sha256.outputs.man }}')/" packaging/tapgres-bin/PKGBUILD
+          sed -i "s/^pkgver=.*/pkgver=${{ needs.release.outputs.version }}/" packaging/tapgres-bin/PKGBUILD
+          sed -i "s/^sha256sums=.*/sha256sums=('${{ needs.release.outputs.man }}')/" packaging/tapgres-bin/PKGBUILD
+          sed -i "s/^sha256sums_x86_64=.*/sha256sums_x86_64=('${{ needs.release.outputs.binary_x86_64 }}')/" packaging/tapgres-bin/PKGBUILD
+          sed -i "s/^sha256sums_aarch64=.*/sha256sums_aarch64=('${{ needs.release.outputs.binary_aarch64 }}')/" packaging/tapgres-bin/PKGBUILD
 
       - name: Deploy tapgres-bin to AUR
         uses: KSXGitHub/github-actions-deploy-aur@v4.2.0
@@ -69,10 +214,18 @@ jobs:
           commit_email: n@sunng.info
           ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
 
+  aur-source:
+    name: Deploy tapgres to AUR
+    needs: release
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+
       - name: Update tapgres PKGBUILD
         run: |
-          sed -i "s/^pkgver=.*/pkgver=${{ steps.sha256.outputs.version }}/" packaging/tapgres/PKGBUILD
-          sed -i "s/^sha256sums=.*/sha256sums=('${{ steps.sha256.outputs.source }}')/" packaging/tapgres/PKGBUILD
+          sed -i "s/^pkgver=.*/pkgver=${{ needs.release.outputs.version }}/" packaging/tapgres/PKGBUILD
+          sed -i "s/^sha256sums=.*/sha256sums=('${{ needs.release.outputs.source }}')/" packaging/tapgres/PKGBUILD
 
       - name: Deploy tapgres to AUR
         uses: KSXGitHub/github-actions-deploy-aur@v4.2.0
