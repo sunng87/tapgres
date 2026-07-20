@@ -38,6 +38,9 @@ jobs:
       - name: Open pull request
         uses: peter-evans/create-pull-request@v7
         with:
+          # Use a PAT so the PR is authored by a real account and triggers
+          # downstream CI checks (the default GITHUB_TOKEN cannot).
+          token: ${{ github.token }}
           commit-message: "chore(flake): update flake.lock"
           title: "chore(flake): update flake.lock"
           body: |
