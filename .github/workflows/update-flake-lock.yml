@@ -40,7 +40,7 @@ jobs:
         with:
           # Use a PAT so the PR is authored by a real account and triggers
           # downstream CI checks (the default GITHUB_TOKEN cannot).
-          token: ${{ github.token }}
+          token: ${{ secrets.PAT }}
           commit-message: "chore(flake): update flake.lock"
           title: "chore(flake): update flake.lock"
           body: |
