@@ -36,7 +36,7 @@ jobs:
       # Opens (or updates) one PR on the `update-flake-lock` branch. When there
       # is nothing to commit the action is a no-op, so quiet weeks create no PR.
       - name: Open pull request
-        uses: peter-evans/create-pull-request@v7
+        uses: peter-evans/create-pull-request@v8
         with:
           # Use a PAT so the PR is authored by a real account and triggers
           # downstream CI checks (the default GITHUB_TOKEN cannot).
