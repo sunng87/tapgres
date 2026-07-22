@@ -116,6 +116,19 @@ Show only server-to-client errors and notices:
 
     tapgres -Y 'message.direction == "b2f" and message.type matches "^Error|Notice$"'
 
+Tee every decoded record to a versioned JSONL session while still capturing
+live. Recording happens before display filtering and the TUI history cap:
+
+    tapgres --save session.jsonl
+
+Reopen a saved session in the TUI without starting capture:
+
+    tapgres --replay session.jsonl --tui
+
+Replay recorded traffic through a display filter, exactly as with a live tap:
+
+    tapgres --replay session.jsonl -Y 'message.type == "Query"'
+
 Grant capture privileges without running as root (pcap mode):
 
     sudo setcap cap_net_raw+ep $(which tapgres)
