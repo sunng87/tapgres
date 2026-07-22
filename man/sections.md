@@ -1,3 +1,32 @@
+# SAVED SESSIONS
+
+`--save FILE` continuously writes every output record as versioned JSONL while
+normal stdout or TUI rendering continues. Recording occurs before display
+filtering and before the TUI history cap, so hidden and evicted live records
+remain in the saved session. Operational line/status records are saved along
+with decoded PostgreSQL messages. An existing destination file is replaced.
+
+`--replay FILE` reads a saved session instead of starting pcap or mitm. Records
+are replayed immediately through the same stdout/TUI renderer and display
+filter as live traffic. Original capture timestamps, client address, direction,
+message type/text, and rich RowDescription/DataRow details are preserved. A
+replay can be copied to another file with `--save`; the input and output paths
+must differ.
+
+The TUI command bar opens with `/` or `:`. `:save FILE` (`:w FILE`) writes the
+currently retained history and continuously records future events. If earlier
+events have left the 50,000-record TUI history, a footer warning reports the
+omission. `:open FILE` (`:o FILE`) validates the complete file before replacing
+the view, retains its newest 50,000 records, switches the UI to replay mode, and
+closes any active recorder. Subsequent live-source display records are discarded
+so timelines do not mix.
+
+The current on-disk schema version is 1. Each JSONL record carries its own
+`schema_version` and RFC 3339 timestamp. Unknown versions and malformed records
+are refused with the file path and line number; tapgres does not guess at an
+incompatible shape. The full format is documented in `docs/session-format.md`
+in the source repository.
+
 # DISPLAY FILTER EXPRESSIONS
 
 The `-Y` / `--display-filter` option limits decoded PostgreSQL messages in

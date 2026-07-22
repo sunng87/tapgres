@@ -38,15 +38,15 @@
 
         # Source cleaning: keep cargo's own selection (crane's
         # commonCargoSources — every .rs/.toml/Cargo.lock across the workspace),
-        # plus the committed `man/sections.md` that the gen_manpage example
-        # embeds with include_str!. cleanCargoSource alone strips it (cargo
-        # doesn't track it), which breaks the example's build; fileset.toSource
-        # makes the extra include explicit and unambiguous.
+        # plus committed non-Rust inputs used by builds and tests. Cargo does
+        # not track these files, so commonCargoSources strips them unless the
+        # fileset includes them explicitly.
         src = pkgs.lib.fileset.toSource {
           root = ./.;
           fileset = pkgs.lib.fileset.unions [
             (craneLib.fileset.commonCargoSources ./.)
             ./man/sections.md
+            ./tests/fixtures/session-v1.jsonl
           ];
         };
 

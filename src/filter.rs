@@ -25,6 +25,9 @@ pub enum MessageDirection {
 /// A decoded message plus the structured fields used by display filters.
 #[derive(Clone, Debug)]
 pub struct DisplayMessage {
+    /// Original capture time in RFC 3339 with millisecond precision. Kept
+    /// separately from `rendered` so saved sessions preserve real timestamps.
+    pub timestamp: String,
     pub rendered: String,
     pub client: SocketAddr,
     pub direction: MessageDirection,
@@ -672,6 +675,7 @@ mod tests {
 
     fn message() -> DisplayMessage {
         DisplayMessage {
+            timestamp: "2026-07-17T12:34:56.789+01:00".into(),
             rendered: "line".into(),
             client: "127.0.0.1:40005".parse().unwrap(),
             direction: MessageDirection::FrontendToBackend,

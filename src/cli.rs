@@ -22,7 +22,8 @@ use crate::state;
                   with the pgwire protocol layer. Use --mode pcap (the default) to passively \
                   capture a local port with libpcap (cleartext only), or --mode mitm to run a \
                   local TLS-terminating proxy that decrypts encrypted sessions. Add --tui to \
-                  either source for an interactive, scrollable, filterable view.",
+                  either source for an interactive, scrollable, filterable view. Use --save to \
+                  record versioned JSONL or --replay to open a saved session without capture.",
     before_help = crate::tui::BANNER
 )]
 pub struct Args {
@@ -30,7 +31,7 @@ pub struct Args {
     #[arg(long, value_enum, default_value_t = Mode::Pcap)]
     pub mode: Mode,
 
-    /// Interactive TUI instead of line-oriented stdout (works with any --mode).
+    /// Interactive TUI instead of line-oriented stdout (works with live or replay sources).
     #[arg(long, default_value_t = false)]
     pub tui: bool,
 
@@ -44,6 +45,34 @@ pub struct Args {
     /// Example: message.type == "Query" and message.text contains "orders"
     #[arg(short = 'Y', long = "display-filter")]
     pub display_filter: Option<DisplayFilter>,
+
+    /// Save every live or replayed output record as versioned JSONL while
+    /// continuing to render normally. Recording happens before display
+    /// filtering and before the TUI history cap is applied. An existing file
+    /// is replaced.
+    #[arg(long, value_name = "FILE")]
+    pub save: Option<PathBuf>,
+
+    /// Read a saved JSONL session instead of starting pcap or mitm capture.
+    /// Replay is loaded at full speed and preserves original timestamps.
+    #[arg(
+        long,
+        value_name = "FILE",
+        conflicts_with_all = [
+            "mode",
+            "port",
+            "interface",
+            "no_promisc",
+            "snaplen",
+            "listen",
+            "upstream",
+            "tls_dir",
+            "tls_cert",
+            "tls_key",
+            "no_upstream_tls"
+        ]
+    )]
+    pub replay: Option<PathBuf>,
 
     /// Maximum retained open + recently-closed connection records.
     /// Open connections are never evicted.
@@ -119,4 +148,35 @@ pub enum Mode {
 /// manpage generator so every option is documented from one place.
 pub fn command() -> clap::Command {
     Args::command()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_save_and_replay_as_file_source_options() {
+        let args = Args::try_parse_from([
+            "tapgres",
+            "--replay",
+            "capture.jsonl",
+            "--save",
+            "copy.jsonl",
+            "--tui",
+        ])
+        .unwrap();
+
+        assert_eq!(args.replay, Some(PathBuf::from("capture.jsonl")));
+        assert_eq!(args.save, Some(PathBuf::from("copy.jsonl")));
+        assert!(args.tui);
+    }
+
+    #[test]
+    fn replay_rejects_live_source_options() {
+        let error =
+            Args::try_parse_from(["tapgres", "--replay", "capture.jsonl", "--mode", "mitm"])
+                .unwrap_err();
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
 }

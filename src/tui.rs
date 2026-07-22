@@ -13,10 +13,12 @@
 //! - `r` — toggle rich message rendering
 //! - `c` — clear
 //! - `y` — edit the display filter
+//! - `/` / `:` — open the command bar (`:save FILE`, `:open FILE`)
 
 use crossbeam_channel::Receiver;
 use std::error::Error;
 use std::io;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -31,10 +33,14 @@ use crate::capture::PcapOpts;
 use crate::decode::{self, Output};
 use crate::filter::DisplayFilter;
 use crate::proxy::ProxyOpts;
+use crate::session::{self, SessionWriter};
 use crate::state::Metrics;
 
 /// Cap on retained lines in the TUI's own buffer.
 const HISTORY_CAP: usize = 50_000;
+/// Trim in chunks during fast replay so a producer cannot grow the TUI buffer
+/// without bound while avoiding an O(n) front-drain for every single record.
+const HISTORY_TRIM_CHUNK: usize = 1_024;
 
 /// tapgres ASCII-art banner. Shown by the CLI (`--help` via `before_help`) and
 /// as the heading of the TUI startup splash.
@@ -53,6 +59,7 @@ pub fn run_pcap(
     metrics: Arc<Metrics>,
     rich: bool,
     filter: DisplayFilter,
+    save: Option<PathBuf>,
 ) -> Result<(), Box<dyn Error>> {
     let splash_lines = pcap_splash_lines(&opts);
     let source_metrics = metrics.clone();
@@ -67,6 +74,7 @@ pub fn run_pcap(
         rich,
         filter,
         splash_lines,
+        save,
     )
 }
 
@@ -90,6 +98,7 @@ pub fn run_mitm(
     metrics: Arc<Metrics>,
     rich: bool,
     filter: DisplayFilter,
+    save: Option<PathBuf>,
 ) -> Result<(), Box<dyn Error>> {
     let splash_lines = mitm_splash_lines(&opts);
     let source_metrics = metrics.clone();
@@ -114,6 +123,41 @@ pub fn run_mitm(
         rich,
         filter,
         splash_lines,
+        save,
+    )
+}
+
+/// TUI over a saved JSONL session. Records are loaded at full speed through
+/// the same channel and rendering path as live capture.
+pub fn run_replay(
+    path: PathBuf,
+    metrics: Arc<Metrics>,
+    rich: bool,
+    filter: DisplayFilter,
+    save: Option<PathBuf>,
+) -> Result<(), Box<dyn Error>> {
+    let source_path = path.clone();
+    run(
+        Box::new(move || {
+            match session::read_tail(&source_path, HISTORY_CAP) {
+                Ok((outputs, dropped)) => {
+                    if dropped > 0 {
+                        decode::status(format!(
+                            "replay: showing the newest {HISTORY_CAP} records; {dropped} earlier records are outside TUI history"
+                        ));
+                    }
+                    outputs.into_iter().for_each(decode::replay);
+                }
+                Err(error) => decode::status(format!("⚠ replay source error: {error}")),
+            }
+            decode::close_output();
+        }),
+        "replay",
+        metrics,
+        rich,
+        filter,
+        Vec::new(),
+        save,
     )
 }
 
@@ -147,11 +191,15 @@ fn run(
     rich: bool,
     filter: DisplayFilter,
     splash_lines: Vec<String>,
+    save: Option<PathBuf>,
 ) -> Result<(), Box<dyn Error>> {
     // One channel: the source (background thread) produces via decode::out,
     // the TUI (this thread) consumes.
     let (tx, rx) = crossbeam_channel::unbounded();
     decode::set_output(tx);
+
+    // Validate/create the save destination before starting a live source.
+    let recorder = save.map(SessionWriter::create).transpose()?;
 
     // The source runs until the process exits; no graceful shutdown here.
     let _source_thread = std::thread::Builder::new()
@@ -159,11 +207,10 @@ fn run(
         .spawn(source)?;
     let _rate_sampler = metrics.spawn_rate_sampler()?;
 
+    let mut app = App::new(rx, mode, metrics, rich, filter, splash_lines);
+    app.recorder = recorder;
     let mut terminal = ratatui::try_init()?;
-    let result = app_loop(
-        &mut terminal,
-        App::new(rx, mode, metrics, rich, filter, splash_lines),
-    );
+    let result = app_loop(&mut terminal, app);
     // Restore the terminal even on error. try_init installs a panic hook that
     // also restores, so panics are covered too.
     let _ = ratatui::try_restore();
@@ -194,7 +241,7 @@ struct App {
     /// `RowDescription` as a typed column list, instead of the flat line. Type
     /// names are shown with an icon-font (Nerd Font) glyph.
     rich: bool,
-    mode: &'static str,
+    mode: String,
     metrics: Arc<Metrics>,
     /// All-time peak messages/sec seen this session, per direction. Used as a
     /// fixed sparkline scale so bars don't rescale as the rate window slides;
@@ -205,11 +252,22 @@ struct App {
     filter_text: String,
     filter_error: Option<String>,
     filter_editing: bool,
+    command_editing: bool,
+    command_text: String,
+    command_notice: Option<(String, bool)>,
+    /// False after `:open`: the loaded replay replaces the live view for the
+    /// rest of this TUI session, while the source channel is drained safely.
+    accept_source_records: bool,
+    /// Number of events removed by the bounded TUI history before `:save`.
+    dropped_events: usize,
     /// Mode-specific connection/capture info lines for the startup splash.
     splash_lines: Vec<String>,
     /// Whether the startup splash is still showing. Flips off once a real
     /// connection is detected (see `app_loop`).
     show_splash: bool,
+    /// Optional continuous JSONL recorder. It receives records before the TUI
+    /// history cap or display filter can hide them.
+    recorder: Option<SessionWriter>,
 }
 
 impl App {
@@ -232,7 +290,7 @@ impl App {
             follow: true,
             wrap: false,
             rich,
-            mode,
+            mode: mode.to_string(),
             metrics,
             peak_msgs_in: 0,
             peak_msgs_out: 0,
@@ -240,8 +298,14 @@ impl App {
             filter_text,
             filter_error: None,
             filter_editing: false,
+            command_editing: false,
+            command_text: String::new(),
+            command_notice: None,
+            accept_source_records: true,
+            dropped_events: 0,
             splash_lines,
             show_splash,
+            recorder: None,
         }
     }
 
@@ -250,11 +314,32 @@ impl App {
     }
 
     fn push_output(&mut self, output: Output) {
+        let write_error = self
+            .recorder
+            .as_mut()
+            .and_then(|recorder| recorder.write(&output).err());
+        if let Some(error) = write_error {
+            self.recorder = None;
+            self.command_notice = Some((format!("recording stopped: {error}"), true));
+        }
         let index = self.events.len();
         if self.matches(&output) {
             self.visible.push(index);
         }
         self.events.push(output);
+        if self.events.len() >= HISTORY_CAP + HISTORY_TRIM_CHUNK {
+            self.trim_history();
+        }
+    }
+
+    fn trim_history(&mut self) {
+        if self.events.len() <= HISTORY_CAP {
+            return;
+        }
+        let drop_n = self.events.len() - HISTORY_CAP;
+        self.events.drain(..drop_n);
+        self.dropped_events = self.dropped_events.saturating_add(drop_n);
+        self.rebuild_visible();
     }
 
     fn rebuild_visible(&mut self) {
@@ -291,6 +376,88 @@ impl App {
         self.rebuild_visible();
     }
 
+    fn execute_command(&mut self) {
+        let command_text = self.command_text.clone();
+        let input = command_text.trim().trim_start_matches([':', '/']).trim();
+        let (name, argument) = input
+            .split_once(char::is_whitespace)
+            .map(|(name, argument)| (name, argument.trim()))
+            .unwrap_or((input, ""));
+
+        let result = match name {
+            "w" | "write" | "save" => self.start_recording(argument),
+            "o" | "open" => self.open_session(argument),
+            "" => Err("command is empty".to_string()),
+            _ => Err(format!("unknown command: {name}")),
+        };
+        self.command_notice = Some(match result {
+            Ok(message) => (message, false),
+            Err(message) => (message, true),
+        });
+        self.command_editing = false;
+    }
+
+    fn start_recording(&mut self, argument: &str) -> Result<String, String> {
+        if argument.is_empty() {
+            return Err("usage: :save FILE".into());
+        }
+        let path = PathBuf::from(argument);
+        let mut recorder = SessionWriter::create(&path).map_err(|error| error.to_string())?;
+        for output in &self.events {
+            recorder.write(output).map_err(|error| error.to_string())?;
+        }
+        recorder.flush().map_err(|error| error.to_string())?;
+        let retained = self.events.len();
+        self.recorder = Some(recorder);
+        let action = if self.accept_source_records {
+            format!("recording {retained} retained events + future traffic")
+        } else {
+            format!("saved {retained} retained replay events")
+        };
+        if self.dropped_events == 0 {
+            Ok(format!("{action} to {}", path.display()))
+        } else {
+            Ok(format!(
+                "{action} to {}; {} earlier events were outside history",
+                path.display(),
+                self.dropped_events
+            ))
+        }
+    }
+
+    fn open_session(&mut self, argument: &str) -> Result<String, String> {
+        if argument.is_empty() {
+            return Err("usage: :open FILE".into());
+        }
+        let path = PathBuf::from(argument);
+        let (outputs, dropped) =
+            session::read_tail(&path, HISTORY_CAP).map_err(|error| error.to_string())?;
+        let count = outputs.len();
+        if let Some(recorder) = self.recorder.as_mut() {
+            recorder.flush().map_err(|error| error.to_string())?;
+        }
+        self.recorder = None;
+        self.events = outputs;
+        self.visible.clear();
+        self.rebuild_visible();
+        self.follow = true;
+        self.mode = "replay".into();
+        self.metrics = Arc::new(Metrics::new());
+        self.peak_msgs_in = 0;
+        self.peak_msgs_out = 0;
+        self.show_splash = false;
+        self.accept_source_records = false;
+        self.dropped_events = dropped;
+        if dropped == 0 {
+            Ok(format!("opened {count} events from {}", path.display()))
+        } else {
+            Ok(format!(
+                "opened newest {count} events from {}; {dropped} earlier events are outside history",
+                path.display()
+            ))
+        }
+    }
+
     /// Leave the splash once a real connection has been detected. Startup
     /// status lines (capture/proxy banner text) arrive before any traffic but
     /// do not open a connection, so they do not trigger this transition.
@@ -304,17 +471,15 @@ impl App {
 fn app_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Result<()> {
     loop {
         while let Ok(record) = app.rx.try_recv() {
-            app.push_output(record);
+            if app.accept_source_records {
+                app.push_output(record);
+            }
         }
         // Leave the splash once a real connection is detected. Startup status
         // lines (capture/proxy banner text) arrive before any traffic but do
         // not open a connection, so they don't trigger this transition.
         app.leave_splash_if_traffic();
-        if app.events.len() > HISTORY_CAP {
-            let drop_n = app.events.len() - HISTORY_CAP;
-            app.events.drain(..drop_n);
-            app.rebuild_visible();
-        }
+        app.trim_history();
 
         // 5 (metrics) + 3 (footer) + 2 (log block borders) rows of chrome.
         let term_h = terminal.size()?.height as usize;
@@ -354,6 +519,12 @@ fn app_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Result
         terminal.draw(|frame| {
             if app.show_splash {
                 draw_splash(frame, &app);
+                if app.command_editing {
+                    let [_, command_area] =
+                        Layout::vertical([Constraint::Fill(1), Constraint::Length(3)])
+                            .areas(frame.area());
+                    draw_command_bar(frame, &app, command_area);
+                }
             } else {
                 draw(frame, &app, log_h);
             }
@@ -385,10 +556,34 @@ fn handle_key(app: &mut App, log_h: usize, key: KeyEvent) -> bool {
     if key.code == KeyCode::Char('c') && ctrl {
         return true;
     }
-    // On the splash screen only honour quit; everything else is ignored until
-    // traffic arrives and the main view takes over.
+    if app.command_editing {
+        match key.code {
+            KeyCode::Esc => {
+                app.command_editing = false;
+                app.command_text.clear();
+            }
+            KeyCode::Enter => app.execute_command(),
+            KeyCode::Backspace => {
+                app.command_text.pop();
+            }
+            KeyCode::Char(ch) if !ctrl => app.command_text.push(ch),
+            _ => {}
+        }
+        return false;
+    }
+    // Keep the command bar available before the first connection so a saved
+    // session can be opened directly from the startup splash.
     if app.show_splash {
-        return key.code == KeyCode::Char('q');
+        return match key.code {
+            KeyCode::Char('q') => true,
+            KeyCode::Char('/') | KeyCode::Char(':') => {
+                app.command_editing = true;
+                app.command_text.clear();
+                app.command_notice = None;
+                false
+            }
+            _ => false,
+        };
     }
     if app.filter_editing {
         match key.code {
@@ -440,6 +635,11 @@ fn handle_key(app: &mut App, log_h: usize, key: KeyEvent) -> bool {
             app.visible.clear();
         }
         KeyCode::Char('y') => app.filter_editing = true,
+        KeyCode::Char('/') | KeyCode::Char(':') => {
+            app.command_editing = true;
+            app.command_text.clear();
+            app.command_notice = None;
+        }
         KeyCode::Esc if !app.filter.is_empty() => app.clear_filter(),
         _ => {}
     }
@@ -465,8 +665,18 @@ fn draw_splash(frame: &mut Frame, app: &App) {
     for line in &app.splash_lines {
         lines.push(Line::raw(format!("  {line}")));
     }
+    if let Some((notice, is_error)) = &app.command_notice {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(
+            format!("  {notice}"),
+            Style::default().fg(if *is_error { Color::Red } else { Color::Green }),
+        ));
+    }
     lines.push(Line::raw(""));
-    lines.push(Line::styled("  waiting for traffic…  press q to quit", dim));
+    lines.push(Line::styled(
+        "  waiting for traffic…  press / for commands · q to quit",
+        dim,
+    ));
 
     // Vertically centre the splash block; horizontally centre each line.
     let height = lines.len() as u16;
@@ -670,7 +880,9 @@ fn draw(frame: &mut Frame, app: &App, log_h: usize) {
     // --- footer: follow/wrap/rich state shown by colour (green = on) ---
     let on = Style::default().fg(Color::Green);
     let off = Style::default();
-    if app.filter_editing {
+    if app.command_editing {
+        draw_command_bar(frame, app, foot_area);
+    } else if app.filter_editing {
         let style = if app.filter_error.is_some() {
             Style::default().fg(Color::Red)
         } else {
@@ -689,8 +901,17 @@ fn draw(frame: &mut Frame, app: &App, log_h: usize) {
             .block(Block::bordered().title_top(" display filter · Enter done · Esc clear ")),
             foot_area,
         );
+    } else if let Some((notice, is_error)) = &app.command_notice {
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                format!(" {notice}"),
+                Style::default().fg(if *is_error { Color::Red } else { Color::Green }),
+            ))
+            .block(Block::bordered().title_top(" status · / command ")),
+            foot_area,
+        );
     } else {
-        let footer = Line::from(vec![
+        let footer = vec![
             Span::raw(" q quit · j/k ↑↓ · PgUp/PgDn · g/G top/bottom · f "),
             Span::styled("follow", if app.follow { on } else { off }),
             Span::raw(" · w "),
@@ -702,10 +923,25 @@ fn draw(frame: &mut Frame, app: &App, log_h: usize) {
                 "display filter",
                 if app.filter.is_empty() { off } else { on },
             ),
-            Span::raw(" · c clear "),
-        ]);
-        frame.render_widget(Paragraph::new(footer).block(Block::bordered()), foot_area);
+            Span::raw(" · / command · c clear "),
+        ];
+        frame.render_widget(
+            Paragraph::new(Line::from(footer)).block(Block::bordered()),
+            foot_area,
+        );
     }
+}
+
+fn draw_command_bar(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(" :", Style::default().fg(Color::Cyan).bold()),
+            Span::raw(&app.command_text),
+            Span::styled("█", Style::default().fg(Color::Cyan)),
+        ]))
+        .block(Block::bordered().title_top(" command · :save FILE · :open FILE · Esc cancel ")),
+        area,
+    );
 }
 
 fn human(value: u64) -> String {
@@ -1060,6 +1296,7 @@ mod tests {
     ) -> Output {
         Output::Message {
             message: DisplayMessage {
+                timestamp: "2026-07-17T12:34:56.789+01:00".into(),
                 rendered: format!("[{kind}] {text}"),
                 client: format!("127.0.0.1:{port}").parse().unwrap(),
                 direction: MessageDirection::FrontendToBackend,
@@ -1285,7 +1522,7 @@ mod tests {
     }
 
     #[test]
-    fn slash_remains_available_for_commands() {
+    fn slash_opens_command_bar_without_touching_display_filter() {
         let (_tx, rx) = crossbeam_channel::unbounded();
         let mut app = App::new(
             rx,
@@ -1303,6 +1540,75 @@ mod tests {
         );
 
         assert!(!app.filter_editing);
+        assert!(app.command_editing);
+    }
+
+    #[test]
+    fn save_command_writes_retained_and_future_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("saved session.jsonl");
+        let mut app = app();
+        app.push_output(message("Query", "SELECT 1", 40005));
+        app.push_output(message("DataRow", "{ id=1 }", 40005));
+        app.filter_text = "message.type == \"Query\"".into();
+        app.update_filter();
+
+        app.command_text = format!("save {}", path.display());
+        app.execute_command();
+        app.push_output(message("ReadyForQuery", "txn=idle", 40005));
+        app.recorder.as_mut().unwrap().flush().unwrap();
+
+        let saved = session::read_all(&path).unwrap();
+        assert_eq!(saved.len(), 3, "display filtering must not affect saving");
+        assert!(
+            app.command_notice
+                .as_ref()
+                .is_some_and(|(message, error)| !error && message.contains("recording"))
+        );
+    }
+
+    #[test]
+    fn open_command_atomically_replaces_view_and_preserves_rich_detail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replay.jsonl");
+        let replayed = message_with_detail("DataRow", "{ id=1 }", 40005, Some(data_row_detail(2)));
+        let mut writer = SessionWriter::create(&path).unwrap();
+        writer.write(&replayed).unwrap();
+        writer.flush().unwrap();
+
+        let mut app = app();
+        app.push_output(message("Query", "old", 40005));
+        app.command_text = format!("open {}", path.display());
+        app.execute_command();
+
+        assert_eq!(app.mode, "replay");
+        assert!(!app.accept_source_records);
+        assert_eq!(app.events.len(), 1);
+        assert!(matches!(
+            app.events[0].detail(),
+            Some(EventDetail::DataRow(columns)) if columns.len() == 2
+        ));
+    }
+
+    #[test]
+    fn failed_open_keeps_the_existing_view() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broken.jsonl");
+        std::fs::write(&path, "not json\n").unwrap();
+        let mut app = app();
+        app.push_output(message("Query", "SELECT 1", 40005));
+
+        app.command_text = format!("open {}", path.display());
+        app.execute_command();
+
+        assert_eq!(app.mode, "test");
+        assert!(app.accept_source_records);
+        assert_eq!(app.events.len(), 1);
+        assert!(
+            app.command_notice
+                .as_ref()
+                .is_some_and(|(message, error)| *error && message.contains("invalid JSONL"))
+        );
     }
 
     #[test]
@@ -1364,7 +1670,7 @@ mod tests {
     }
 
     #[test]
-    fn splash_only_honours_quit() {
+    fn splash_honours_quit_and_command_bar() {
         let (_tx, rx) = crossbeam_channel::unbounded();
         let mut app = App::new(
             rx,
@@ -1381,6 +1687,15 @@ mod tests {
             KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
         ));
         assert!(!app.filter_editing);
+        // Commands remain available so a replay can be opened before live
+        // traffic arrives.
+        assert!(!handle_key(
+            &mut app,
+            10,
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+        ));
+        assert!(app.command_editing);
+        app.command_editing = false;
         // `q` quits even from the splash.
         assert!(handle_key(
             &mut app,
