@@ -51,5 +51,5 @@ rcgen = "0.14"
 # examples/gen_manpage.rs), so no roff-building crate is needed. clap_mangen
 # is dev-only: it never reaches a normal `cargo build`/release/`cargo install`.
 [dev-dependencies]
-clap_mangen = "0.2"
+clap_mangen = "0.3"
 tempfile = "3"
