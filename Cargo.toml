@@ -14,7 +14,7 @@ rust-version = "1.85"
 
 [dependencies]
 # Protocol-layer only: gives us the `messages` module for decoding.
-pgwire = { version = "0.40", default-features = false }
+pgwire = { version = "0.41", default-features = false }
 pcap = "2.4"
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
