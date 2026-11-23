@@ -532,10 +532,10 @@ impl App {
         }
         let path = expand_tilde(argument);
         // Never truncate the file the replay source thread is still reading.
-        if let Some(source) = &self.replay_source {
-            if same_path(source, &path) {
-                return Err("refusing to overwrite the replayed input file".into());
-            }
+        if let Some(source) = &self.replay_source
+            && same_path(source, &path)
+        {
+            return Err("refusing to overwrite the replayed input file".into());
         }
         let mut recorder = SessionWriter::create(&path).map_err(|error| error.to_string())?;
         for output in &self.events {
@@ -620,10 +620,10 @@ fn expand_tilde(input: &str) -> PathBuf {
         if let Some(home) = std::env::var_os("HOME") {
             return Path::new(&home).join(rest);
         }
-    } else if input == "~" {
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home);
-        }
+    } else if input == "~"
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return PathBuf::from(home);
     }
     PathBuf::from(input)
 }
@@ -1264,7 +1264,7 @@ fn with_commas(n: u64) -> String {
     let bytes = s.as_bytes();
     let mut out = String::with_capacity(s.len() + s.len() / 3);
     for (i, b) in bytes.iter().enumerate() {
-        if i != 0 && (bytes.len() - i) % 3 == 0 {
+        if i != 0 && (bytes.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(*b as char);
@@ -1385,10 +1385,10 @@ fn event_height(evt: &Output, width: usize, view: View) -> usize {
 /// structured detail is available — a header line followed by a key/value (or
 /// typed column) breakdown.
 fn event_lines(evt: &Output, view: View) -> Vec<Line<'_>> {
-    if view.rich {
-        if let Some(detail) = evt.detail() {
-            return render_rich(evt.rendered(), detail);
-        }
+    if view.rich
+        && let Some(detail) = evt.detail()
+    {
+        return render_rich(evt.rendered(), detail);
     }
     vec![build_line(evt.rendered())]
 }

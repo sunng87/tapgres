@@ -107,15 +107,15 @@ pub fn run(opts: PcapOpts, metrics: Arc<Metrics>) -> Result<(), Box<dyn Error>> 
 /// Report newly kernel-dropped packets (capture couldn't keep up) since the
 /// last check, as a status line. Silent when nothing was dropped.
 fn report_drops(cap: &mut Capture<pcap::Active>, last_dropped: &mut u32) {
-    if let Ok(stats) = cap.stats() {
-        if stats.dropped > *last_dropped {
-            let delta = stats.dropped - *last_dropped;
-            *last_dropped = stats.dropped;
-            decode::status(format!(
-                "tapgres: kernel dropped {delta} packets (capture can't keep up); \
+    if let Ok(stats) = cap.stats()
+        && stats.dropped > *last_dropped
+    {
+        let delta = stats.dropped - *last_dropped;
+        *last_dropped = stats.dropped;
+        decode::status(format!(
+            "tapgres: kernel dropped {delta} packets (capture can't keep up); \
                  decoding may have gaps"
-            ));
-        }
+        ));
     }
 }
 

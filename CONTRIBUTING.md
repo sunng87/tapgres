@@ -14,7 +14,7 @@ cargo build
 cargo test         # runs the unit and integration tests
 ```
 
-Without Nix you need a Rust toolchain (edition 2024, so Rust >= 1.85 — the
+Without Nix you need a Rust toolchain (Rust >= 1.89, the
 `rust-version` in `Cargo.toml`) and libpcap's development headers
 (`libpcap-dev` on Debian/Ubuntu, `libpcap` on Arch/Fedora):
 

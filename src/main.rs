@@ -102,13 +102,13 @@ where
             let mut stderr = std::io::stderr().lock();
             let mut recorder_error = None;
             while let Ok(record) = rx.recv() {
-                if let Some(writer) = recorder.as_mut() {
-                    if let Err(error) = writer.write(&record) {
-                        let message = format!("tapgres: recording stopped: {error}");
-                        let _ = writeln!(stderr, "{message}");
-                        recorder_error = Some(io::Error::other(message));
-                        recorder = None;
-                    }
+                if let Some(writer) = recorder.as_mut()
+                    && let Err(error) = writer.write(&record)
+                {
+                    let message = format!("tapgres: recording stopped: {error}");
+                    let _ = writeln!(stderr, "{message}");
+                    recorder_error = Some(io::Error::other(message));
+                    recorder = None;
                 }
                 if !record.matches_filter(&filter) {
                     continue;

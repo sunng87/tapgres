@@ -50,7 +50,7 @@ jobs:
 
   msrv:
     # Matches `rust-version` in Cargo.toml. Bump both together.
-    name: MSRV (Rust 1.85)
+    name: MSRV (Rust 1.89)
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
@@ -63,7 +63,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.85"
+          toolchain: "1.89"
 
       - name: cargo check
         run: cargo check --all-targets --locked

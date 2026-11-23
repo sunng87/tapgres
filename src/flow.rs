@@ -410,10 +410,10 @@ impl ConnTable {
         };
         if should_open {
             // Retire any stale entry we're replacing before opening afresh.
-            if let Some(old) = self.map.remove(&key) {
-                if old.closed_at.is_none() {
-                    self.metrics.close_connection(&old.stats);
-                }
+            if let Some(old) = self.map.remove(&key)
+                && old.closed_at.is_none()
+            {
+                self.metrics.close_connection(&old.stats);
             }
             decode::out(format!(
                 "[{}] === new connection  {}:{}  ->  {}:{}  (port {}) ===",
@@ -482,10 +482,10 @@ impl ConnTable {
             self.map.iter().map(|(k, c)| (c.last_seen, *k)).collect();
         by_age.sort_unstable_by_key(|(seen, _)| *seen);
         for (_, key) in by_age.into_iter().take(n) {
-            if let Some(conn) = self.map.remove(&key) {
-                if conn.closed_at.is_none() {
-                    self.metrics.close_connection(&conn.stats);
-                }
+            if let Some(conn) = self.map.remove(&key)
+                && conn.closed_at.is_none()
+            {
+                self.metrics.close_connection(&conn.stats);
             }
         }
     }
