@@ -111,11 +111,21 @@ fn parse_ipv4(b: &[u8]) -> Option<TcpSegment> {
     if proto != 6 {
         return None; // not TCP
     }
-    let total_len = u16::from_be_bytes([b[2], b[3]]) as usize;
-    let end = total_len.min(b.len());
-    if end < ihl {
+    // Non-first IP fragment: it carries no TCP header, so parsing its bytes as
+    // L4 would be garbage. (First fragments, offset 0, still hold the header.)
+    let frag_offset = u16::from_be_bytes([b[6], b[7]]) & 0x1fff;
+    if frag_offset != 0 {
         return None;
     }
+    let total_len = u16::from_be_bytes([b[2], b[3]]) as usize;
+    // Segmentation offload (TSO/GSO) hands us merged super-packets whose IP
+    // total_length is 0 (or, defensively, anything short of the header); fall
+    // back to the captured length so we don't silently drop the whole segment.
+    let end = if total_len >= ihl {
+        total_len.min(b.len())
+    } else {
+        b.len()
+    };
     let src = IpAddr::V4(Ipv4Addr::new(b[12], b[13], b[14], b[15]));
     let dst = IpAddr::V4(Ipv4Addr::new(b[16], b[17], b[18], b[19]));
     parse_tcp(&b[ihl..end], src, dst)
@@ -135,6 +145,14 @@ fn parse_ipv6(b: &[u8]) -> Option<TcpSegment> {
     // Walk extension headers (best-effort). Stop at TCP, or bail on anything
     // we don't model (e.g. ESP).
     while is_extension_header(next_header) && off + 8 <= body_end {
+        // A non-first fragment (fragment header, offset != 0) carries no TCP
+        // header — drop it rather than parse its payload as L4.
+        if next_header == 44 {
+            let frag = u16::from_be_bytes([b[off + 2], b[off + 3]]);
+            if (frag >> 3) != 0 {
+                return None;
+            }
+        }
         let ext_next = b[off];
         let ext_len = extension_header_len(next_header, &b[off..body_end])?;
         next_header = ext_next;
@@ -204,4 +222,59 @@ fn parse_tcp(l4: &[u8], src: IpAddr, dst: IpAddr) -> Option<TcpSegment> {
         rst: flags & 0x04 != 0,
         payload,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a raw IPv4+TCP frame. `total_len_override` forces the IP
+    /// total-length field (use `Some(0)` to mimic segmentation offload);
+    /// `frag_offset` sets the IPv4 fragment offset.
+    fn ipv4_tcp(frag_offset: u16, total_len_override: Option<u16>, payload: &[u8]) -> Vec<u8> {
+        let total = 20 + 20 + payload.len();
+        let total_len = total_len_override.unwrap_or(total as u16);
+        let mut f = vec![0u8; total];
+        f[0] = 0x45; // version 4, ihl 5
+        f[2..4].copy_from_slice(&total_len.to_be_bytes());
+        f[6..8].copy_from_slice(&(frag_offset & 0x1fff).to_be_bytes());
+        f[9] = 6; // TCP
+        f[12..16].copy_from_slice(&[127, 0, 0, 1]);
+        f[16..20].copy_from_slice(&[127, 0, 0, 1]);
+        // TCP header at offset 20
+        f[20..22].copy_from_slice(&40_000u16.to_be_bytes()); // src port
+        f[22..24].copy_from_slice(&5432u16.to_be_bytes()); // dst port
+        f[24..28].copy_from_slice(&1000u32.to_be_bytes()); // seq
+        f[32] = 0x50; // data offset = 5 words
+        f[33] = 0x18; // PSH|ACK
+        f[40..].copy_from_slice(payload);
+        f
+    }
+
+    #[test]
+    fn parses_a_well_formed_ipv4_tcp_segment() {
+        let seg = parse_frame(&ipv4_tcp(0, None, b"hello"), DLT_RAW).unwrap();
+        assert_eq!(seg.src_port, 40_000);
+        assert_eq!(seg.dst_port, 5432);
+        assert_eq!(seg.seq, 1000);
+        assert_eq!(seg.payload, b"hello");
+    }
+
+    #[test]
+    fn zero_total_length_falls_back_to_captured_length() {
+        // TSO/GSO capture: total_length == 0 must not drop the payload.
+        let seg = parse_frame(&ipv4_tcp(0, Some(0), b"offloaded-bytes"), DLT_RAW).unwrap();
+        assert_eq!(seg.payload, b"offloaded-bytes");
+    }
+
+    #[test]
+    fn non_first_fragment_is_dropped() {
+        // A fragment with non-zero offset has no TCP header of its own.
+        assert!(parse_frame(&ipv4_tcp(37, None, b"junk"), DLT_RAW).is_none());
+    }
+
+    #[test]
+    fn runt_frame_is_rejected() {
+        assert!(parse_frame(&[0x45, 0, 0], DLT_RAW).is_none());
+    }
 }

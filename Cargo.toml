@@ -10,7 +10,7 @@ categories = ["command-line-utilities", "database", "network-programming"]
 homepage = "https://github.com/sunng87/tapgres"
 repository = "https://github.com/sunng87/tapgres"
 readme = "README.md"
-rust-version = "1.85"
+rust-version = "1.89"
 
 [dependencies]
 # Protocol-layer only: gives us the `messages` module for decoding.

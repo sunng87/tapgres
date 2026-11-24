@@ -117,7 +117,16 @@ pub async fn serve(opts: ProxyOpts, metrics: Arc<Metrics>) -> Result<(), Box<dyn
 
     let opts = Arc::new(opts);
     loop {
-        let (client, peer) = listener.accept().await?;
+        let (client, peer) = match listener.accept().await {
+            Ok(pair) => pair,
+            // A transient per-connection error (EMFILE/ECONNABORTED burst) must
+            // not tear down the whole proxy; log, back off briefly, keep serving.
+            Err(e) => {
+                decode::status(format!("tapgres: accept error: {e}"));
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                continue;
+            }
+        };
         let opts = opts.clone();
         let tls = tls.clone();
         let metrics = metrics.clone();
@@ -145,33 +154,45 @@ async fn handle_connection(
         metrics: metrics.clone(),
         stats: stats.clone(),
     };
-    // Read the first 8 bytes: 4-byte length + 4-byte magic/protocol.
+    // PG17+ direct SSL (`sslnegotiation=direct`) opens with a raw TLS
+    // ClientHello instead of an SSLRequest. Its first byte is the TLS handshake
+    // record type 0x16; every classic PostgreSQL opening message starts its
+    // Int32 length with 0x00, so one peeked byte disambiguates without
+    // consuming it (the TLS acceptor then reads the ClientHello itself).
+    let mut probe = [0u8; 1];
+    let direct_tls = matches!(client.peek(&mut probe).await, Ok(n) if n >= 1 && probe[0] == 0x16);
+
+    // Negotiate the client-facing transport. A client may send GssEncRequest
+    // (which we refuse) and then retry with SSLRequest or a cleartext Startup on
+    // the same connection, so loop until we settle on TLS or cleartext.
     let mut head = [0u8; 8];
-    if client.read_exact(&mut head).await.is_err() {
-        return Ok(()); // client sent < 8 bytes (or nothing); nothing to tap
-    }
-    let body = &head[4..8];
-
-    // Cancel requests are one-shot, raw, and must reach the server verbatim on
-    // their own connection — relay them untouched, no TLS, no decoding.
-    if body == CANCEL_MAGIC {
-        let mut server = TcpStream::connect(opts.upstream.as_str()).await?;
-        server.write_all(&head).await?;
-        return raw_relay(client, server).await;
-    }
-
-    // --- Decide the client-facing transport ---
-    let client_tls = body == SSL_MAGIC;
-    let initial: Vec<u8> = if client_tls {
-        client.write_all(b"S").await?; // accept SSL locally
-        Vec::new()
-    } else if body == GSS_MAGIC {
-        // We don't speak GSS; refuse so the client falls back to cleartext.
-        client.write_all(b"N").await?;
-        Vec::new()
+    let (client_tls, initial): (bool, Vec<u8>) = if direct_tls {
+        (true, Vec::new())
     } else {
-        // Cleartext Startup (or anything else): these 8 bytes begin it.
-        head.to_vec()
+        loop {
+            if client.read_exact(&mut head).await.is_err() {
+                return Ok(()); // client sent < 8 bytes (or nothing); nothing to tap
+            }
+            let body = &head[4..8];
+            if body == CANCEL_MAGIC {
+                // One-shot cancel: relay verbatim on its own connection,
+                // negotiating upstream TLS the same way a real client would so
+                // hostssl-only servers still accept it.
+                let server = TcpStream::connect(opts.upstream.as_str()).await?;
+                let mut server = upstream_transport(server, &opts, &tls).await?;
+                server.write_all(&head).await?;
+                return raw_relay(client, server).await;
+            } else if body == SSL_MAGIC {
+                client.write_all(b"S").await?; // accept SSL locally
+                break (true, Vec::new());
+            } else if body == GSS_MAGIC {
+                client.write_all(b"N").await?; // we don't speak GSS; client retries
+                continue;
+            } else {
+                // Cleartext Startup (or anything else): these 8 bytes begin it.
+                break (false, head.to_vec());
+            }
+        }
     };
     // The cleartext Startup's first 8 bytes (read above to detect
     // SSL/GSS/cancel) are forwarded upstream below and also fed back into the
@@ -186,65 +207,95 @@ async fn handle_connection(
     };
 
     // --- Upstream transport ---
-    let mut server = TcpStream::connect(opts.upstream.as_str()).await?;
-    let server_stream: ProxyStream = if opts.no_upstream_tls {
-        ProxyStream::Plain(server)
-    } else {
-        server.write_all(&SSL_REQUEST).await?; // probe the server for TLS
-        let mut reply = [0u8; 1];
-        match server.read_exact(&mut reply).await {
-            Ok(_) if reply[0] == b'S' => {
-                let connector = TlsConnector::from(tls.upstream_client_config.clone());
-                let name = ServerName::try_from("localhost".to_string())
-                    .map_err(|e| io::Error::other(format!("invalid upstream name: {e}")))?;
-                let s = connector.connect(name, server).await?;
-                ProxyStream::Tls(Box::new(s.into()))
-            }
-            _ => ProxyStream::Plain(server), // 'N' or EOF: stay cleartext upstream
-        }
-    };
+    let server = TcpStream::connect(opts.upstream.as_str()).await?;
+    let mut server_stream = upstream_transport(server, &opts, &tls).await?;
 
     // Forward the client's initial bytes (the Startup) upstream.
-    let mut server_stream = server_stream;
     if !initial.is_empty() {
         server_stream.write_all(&initial).await?;
     }
 
-    // Bidirectional decode + relay.
+    // Bidirectional decode + relay. Run both directions to completion with
+    // `join!` (not `select!`+abort) so a half-closed peer — a client that
+    // shuts down its write side and keeps reading results — isn't cut off
+    // mid-response. EOF on one leg shuts down the paired write half, which
+    // propagates the close naturally.
     let (client_rd, client_wr) = tokio::io::split(client_stream);
     let (server_rd, server_wr) = tokio::io::split(server_stream);
-    let mut to_client = tokio::spawn(pump(
-        server_rd,
-        client_wr,
-        Role::Server,
-        metrics.clone(),
-        stats.clone(),
-        Vec::new(),
-    ));
-    let mut to_server = tokio::spawn(pump(
-        client_rd,
-        server_wr,
-        Role::Client,
-        metrics.clone(),
-        stats.clone(),
-        initial,
-    ));
-    // Finish as soon as either side closes; abort the other half.
-    tokio::select! {
-        _ = &mut to_client => {
-            to_server.abort();
-            let _ = to_server.await;
-        }
-        _ = &mut to_server => {
-            to_client.abort();
-            let _ = to_client.await;
+    let (to_client, to_server) = tokio::join!(
+        pump(
+            server_rd,
+            client_wr,
+            Role::Server,
+            metrics.clone(),
+            stats.clone(),
+            Vec::new(),
+        ),
+        pump(
+            client_rd,
+            server_wr,
+            Role::Client,
+            metrics.clone(),
+            stats.clone(),
+            initial,
+        ),
+    );
+    for result in [to_client, to_server] {
+        if let Err(e) = result {
+            decode::status(format!("tapgres: relay ended with error: {e}"));
         }
     }
     Ok(())
 }
 
-/// Copy bytes one way without decoding (used for cancel-request connections).
-async fn raw_relay(client: TcpStream, server: TcpStream) -> io::Result<()> {
+/// Establish the upstream transport, probing the server for TLS unless
+/// `--no-upstream-tls` was given. Shared by the normal relay and the cancel
+/// path so both negotiate identically.
+async fn upstream_transport(
+    mut server: TcpStream,
+    opts: &ProxyOpts,
+    tls: &TlsMaterial,
+) -> io::Result<ProxyStream> {
+    if opts.no_upstream_tls {
+        return Ok(ProxyStream::Plain(server));
+    }
+    server.write_all(&SSL_REQUEST).await?; // probe the server for TLS
+    let mut reply = [0u8; 1];
+    match server.read_exact(&mut reply).await {
+        Ok(_) if reply[0] == b'S' => {
+            let connector = TlsConnector::from(tls.upstream_client_config.clone());
+            let s = connector
+                .connect(upstream_server_name(opts), server)
+                .await?;
+            Ok(ProxyStream::Tls(Box::new(s.into())))
+        }
+        _ => Ok(ProxyStream::Plain(server)), // 'N' or EOF: stay cleartext upstream
+    }
+}
+
+/// SNI to present to the upstream, derived from the configured host so
+/// SNI-routing poolers see the right name. Certificate verification is disabled
+/// (local server), so a fallback is harmless.
+fn upstream_server_name(opts: &ProxyOpts) -> ServerName<'static> {
+    let host = opts
+        .upstream
+        .rsplit_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or(opts.upstream.as_str())
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    ServerName::try_from(host.to_string())
+        .unwrap_or_else(|_| ServerName::try_from("localhost".to_string()).unwrap())
+}
+
+/// Copy bytes both ways without decoding (used for cancel-request connections).
+/// Generic over the stream types so a plain client can be relayed against a
+/// possibly-TLS upstream.
+async fn raw_relay<A, B>(client: A, server: B) -> io::Result<()>
+where
+    A: AsyncRead + AsyncWrite,
+    B: AsyncRead + AsyncWrite,
+{
     let (mut c_rd, mut c_wr) = tokio::io::split(client);
     let (mut s_rd, mut s_wr) = tokio::io::split(server);
     let _ = tokio::try_join!(
@@ -376,9 +427,13 @@ fn materialize_tls(opts: &ProxyOpts) -> Result<TlsMaterial, Box<dyn Error>> {
         }
     };
 
-    let server_config = ServerConfig::builder()
+    let mut server_config = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)?;
+    // Advertise the PostgreSQL ALPN protocol so PG17+ direct-SSL clients
+    // (`sslnegotiation=direct`), which require ALPN, complete the handshake.
+    // Clients using the classic SSLRequest negotiation simply don't offer it.
+    server_config.alpn_protocols = vec![b"postgresql".to_vec()];
 
     // The upstream leg talks to a local, user-controlled server, so we don't
     // verify its certificate — only that the handshake completes.
@@ -547,5 +602,94 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn upstream_server_name_parses_host_forms() {
+        let name = |upstream: &str| {
+            let opts = ProxyOpts {
+                listen: String::new(),
+                upstream: upstream.to_string(),
+                tls_dir: PathBuf::new(),
+                tls_cert: None,
+                tls_key: None,
+                no_upstream_tls: false,
+            };
+            upstream_server_name(&opts)
+        };
+        assert_eq!(name("db.example.com:5432"), name("db.example.com:5432"));
+        // Hostname form yields a DNS name; IPv6 brackets are stripped; both parse.
+        assert!(matches!(
+            name("db.example.com:5432"),
+            ServerName::DnsName(_)
+        ));
+        assert!(matches!(name("[::1]:5432"), ServerName::IpAddress(_)));
+        assert!(matches!(name("127.0.0.1:5432"), ServerName::IpAddress(_)));
+    }
+
+    /// End-to-end cleartext path: a client's Startup and the upstream's
+    /// ReadyForQuery both traverse the proxy and are decoded (reflected in
+    /// metrics), and the upstream SSL probe is answered and relayed correctly.
+    #[tokio::test]
+    async fn cleartext_startup_relays_and_decodes_both_directions() {
+        // Fake upstream: refuse the SSL probe, read the Startup, reply RFQ.
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = upstream.accept().await.unwrap();
+            let mut probe = [0u8; 8];
+            s.read_exact(&mut probe).await.unwrap();
+            assert_eq!(probe, SSL_REQUEST, "proxy should probe upstream for TLS");
+            s.write_all(b"N").await.unwrap(); // refuse -> cleartext upstream
+            // Startup: Int32 len, Int32 protocol(196608), "user\0tapgres\0\0".
+            let params = b"user\0tapgres\0\0";
+            let total = 8 + params.len();
+            let mut startup = Vec::new();
+            startup.extend_from_slice(&(total as u32).to_be_bytes());
+            startup.extend_from_slice(&196_608u32.to_be_bytes());
+            startup.extend_from_slice(params);
+            let mut got = vec![0u8; total];
+            s.read_exact(&mut got).await.unwrap();
+            assert_eq!(got, startup, "full Startup should reach upstream");
+            // ReadyForQuery: 'Z', len 5, status 'I'.
+            s.write_all(&[b'Z', 0, 0, 0, 5, b'I']).await.unwrap();
+        });
+
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let opts = Arc::new(ProxyOpts {
+            listen: proxy_addr.to_string(),
+            upstream: upstream_addr.to_string(),
+            tls_dir: unique_temp_dir(),
+            tls_cert: None,
+            tls_key: None,
+            no_upstream_tls: false,
+        });
+        let tls = Arc::new(materialize_tls(&opts).unwrap());
+        let metrics = Arc::new(Metrics::new());
+        let m = metrics.clone();
+        let handled = tokio::spawn(async move {
+            let (client, _) = proxy.accept().await.unwrap();
+            let _ = handle_connection(client, opts, tls, m).await;
+        });
+
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        let params = b"user\0tapgres\0\0";
+        let total = 8 + params.len();
+        let mut startup = Vec::new();
+        startup.extend_from_slice(&(total as u32).to_be_bytes());
+        startup.extend_from_slice(&196_608u32.to_be_bytes());
+        startup.extend_from_slice(params);
+        client.write_all(&startup).await.unwrap();
+        let mut rfq = [0u8; 6];
+        client.read_exact(&mut rfq).await.unwrap();
+        assert_eq!(rfq, [b'Z', 0, 0, 0, 5, b'I'], "RFQ relayed to client");
+        drop(client); // half-close; join! must still finish the other leg
+        handled.await.unwrap();
+
+        let snap = metrics.snapshot();
+        assert!(snap.msgs_in >= 1, "client Startup should be decoded");
+        assert!(snap.msgs_out >= 1, "server ReadyForQuery should be decoded");
+        assert_eq!(snap.conns_live, 0, "connection guard should close it");
     }
 }

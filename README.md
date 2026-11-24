@@ -62,12 +62,14 @@ sudo setcap cap_net_raw+ep $(which tapgres)
 | `w` / `r` | wrap / rich display |
 | `c` | clear |
 | `y` | edit the display filter |
-| `/` / `:` | command bar (`:save FILE`, `:open FILE`) |
-| `Esc` | clear the display filter |
+| `/`, `n` / `N` | search message text, next / previous match |
+| `:` | command bar (`:save FILE`, `:open FILE`) |
+| `Esc` | clear the search, then the display filter |
 
 Display filters (`-Y` / `--display-filter`) use a small typed expression
 language with fields like `message.type`, `message.text`, `client.ip`, and
-`client.port`. See `man tapgres` for the full field and operator reference.
+`client.port` (with `==`, `!=`, ordered `<`/`>` on the port, `in`, `contains`,
+and `matches`). See `man tapgres` for the full field and operator reference.
 
 ## Save and replay
 
@@ -98,17 +100,27 @@ Schema version 1 and its compatibility rules are defined in
 [`docs/session-format.md`](docs/session-format.md). Unsupported schema versions
 and malformed records are refused with a file and line-numbered error.
 
+> **Sensitive data.** Captures and saved sessions are cleartext: they contain
+> query text, returned row values, connection parameters, and error messages
+> exactly as they crossed the wire. Treat `--save` / `:save` files as sensitive
+> and protect them accordingly. See [SECURITY.md](SECURITY.md).
+
 ## Installation
 
-**Prebuilt binary** (Linux x86_64, from
-[releases](https://github.com/sunng87/tapgres/releases)):
+**Prebuilt binaries** (from
+[releases](https://github.com/sunng87/tapgres/releases):
+`tapgres-linux-x86_64`, `tapgres-linux-aarch64`, `tapgres-macos-x86_64`,
+`tapgres-macos-arm64`; a `SHA256SUMS` file in each release covers all of
+them):
 
 ```sh
 curl -L -o tapgres https://github.com/sunng87/tapgres/releases/latest/download/tapgres-linux-x86_64
 chmod +x tapgres && sudo mv tapgres /usr/local/bin/
 ```
 
-Built with Nix; on a non-Nix Linux it needs `libpcap.so.1` on the library path.
+The linux-x86_64 binary is built with Nix; on a non-Nix Linux it needs
+`libpcap.so.1` on the library path (see
+[Troubleshooting](#troubleshooting)).
 
 **Arch Linux (AUR):**
 
@@ -130,6 +142,61 @@ cargo install --path .
 ```
 
 A manual page is included in the Nix and Arch packages (`man tapgres`).
+
+## Troubleshooting
+
+**"Permission denied" opening the capture (Linux).** pcap mode needs
+`CAP_NET_RAW`. Grant it once instead of running as root:
+
+```sh
+sudo setcap cap_net_raw+ep $(which tapgres)
+```
+
+**"Permission denied" opening the capture (macOS).** macOS captures packets
+through the BPF devices (`/dev/bpf0`, `/dev/bpf1`, …), which are root-only by
+default — and `setcap` is a Linux mechanism that does not exist on macOS.
+Either run `sudo tapgres`, or install Wireshark's **ChmodBPF** helper
+(bundled with the Wireshark installer, or standalone via
+`brew install --cask wireshark-chmodbpf`). ChmodBPF installs a launch daemon
+that makes `/dev/bpf*` readable by the `access_bpf` group at every boot; make
+sure your user is in that group. Note that this grants every group member
+capture access to *all* interfaces, not just loopback.
+
+**macOS refuses to run a downloaded binary** ("cannot be opened because the
+developer cannot be verified", or the process is killed immediately). The
+release binaries are not code-signed; if your download path added the
+quarantine attribute, remove it:
+
+```sh
+xattr -d com.apple.quarantine ./tapgres
+```
+
+**No traffic appears.**
+
+- `psql` and many other clients connect over a **Unix domain socket** when no
+  host is given — invisible to pcap. Force TCP with `-h 127.0.0.1`.
+- tapgres captures the **loopback** interface by default (`lo` on Linux,
+  `lo0` on macOS). For a server on another machine, pick the right interface
+  with `-i eth0`. libpcap's `any` pseudo-device (`-i any`) captures every
+  interface at once but is **Linux-only**.
+- If the client negotiated **TLS** (`sslmode=require`, …), pcap mode can
+  observe the SSL negotiation but not the encrypted stream that follows. Use
+  `--mode mitm` to decode encrypted sessions.
+
+**Clients reject the mitm proxy's certificate.** In `--mode mitm`, tapgres
+terminates TLS with an auto-generated CA written to `--tls-dir` (default
+`~/.config/tapgres`). Point each client at that CA: copy `ca.crt` to the client
+and connect with `sslrootcert=…/ca.crt` and `sslmode=verify-ca`, for example
+
+```sh
+psql "host=127.0.0.1 port=15432 dbname=postgres sslrootcert=ca.crt sslmode=verify-ca"
+```
+
+Distribute only `ca.crt`; `ca.key` is the CA's private key and must stay local.
+
+**`libpcap.so.1: cannot open shared object file`** when running a prebuilt
+Linux binary: install your distribution's libpcap runtime package
+(`libpcap0.8` on Debian/Ubuntu, `libpcap` on Arch and Fedora).
 
 ## Develop
 
