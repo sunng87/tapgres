@@ -281,6 +281,13 @@ struct App {
     /// search is active; `n`/`N` jump between matches and matches are highlighted.
     search_editing: bool,
     search_text: String,
+    /// Cached positions into `visible` matching `search_hits_for`, so the
+    /// footer count and `n`/`N` don't re-render the whole history every frame.
+    /// Kept current incrementally on push/trim; recomputed only when the term
+    /// changes or `visible` is rebuilt.
+    search_hits: Vec<usize>,
+    /// The search term `search_hits` was computed for; `None` means stale.
+    search_hits_for: Option<String>,
     command_editing: bool,
     command_text: String,
     command_notice: Option<(String, bool)>,
@@ -339,6 +346,8 @@ impl App {
             filter_snapshot: String::new(),
             search_editing: false,
             search_text: String::new(),
+            search_hits: Vec::new(),
+            search_hits_for: None,
             command_editing: false,
             command_text: String::new(),
             command_notice: None,
@@ -375,10 +384,17 @@ impl App {
             }
         }
         let index = self.events.len();
-        if self.matches(&output) {
+        let shown = self.matches(&output);
+        if shown {
             self.visible.push(index);
         }
         self.events.push(output);
+        if shown && self.search_hits_current() && !self.search_text.is_empty() {
+            let needle = self.search_text.to_lowercase();
+            if self.event_matches_search(index, &needle) {
+                self.search_hits.push(self.visible.len() - 1);
+            }
+        }
         if self.events.len() >= HISTORY_CAP + HISTORY_TRIM_CHUNK {
             self.trim_history();
         }
@@ -402,9 +418,15 @@ impl App {
             *index -= drop_n;
         }
         self.scroll = self.scroll.saturating_sub(removed_visible);
+        // Hits are ascending positions into `visible`; shift them the same way.
+        self.search_hits.retain(|&p| p >= removed_visible);
+        for position in &mut self.search_hits {
+            *position -= removed_visible;
+        }
     }
 
     fn rebuild_visible(&mut self) {
+        self.search_hits_for = None;
         self.visible = self
             .events
             .iter()
@@ -462,21 +484,38 @@ impl App {
         self.visible
             .iter()
             .enumerate()
-            .filter(|(_, event_index)| {
-                self.events[**event_index]
-                    .rendered()
-                    .to_lowercase()
-                    .contains(&needle)
-            })
+            .filter(|&(_, &event_index)| self.event_matches_search(event_index, &needle))
             .map(|(position, _)| position)
             .collect()
+    }
+
+    fn event_matches_search(&self, event_index: usize, needle: &str) -> bool {
+        self.events[event_index]
+            .rendered()
+            .to_lowercase()
+            .contains(needle)
+    }
+
+    /// Whether `search_hits` reflects the current term and `visible`.
+    fn search_hits_current(&self) -> bool {
+        self.search_hits_for.as_deref() == Some(self.search_text.as_str())
+    }
+
+    /// Recompute the cached search hits only if the term changed or `visible`
+    /// was rebuilt since the last call. Steady state is an O(1) check.
+    fn refresh_search_hits(&mut self) {
+        if !self.search_hits_current() {
+            self.search_hits = self.search_matches();
+            self.search_hits_for = Some(self.search_text.clone());
+        }
     }
 
     /// Jump to the next (`forward`) or previous match relative to the current
     /// scroll anchor, wrapping around. `include_current` lets the initial jump
     /// land on a match already at the anchor.
     fn jump_to_match(&mut self, forward: bool, include_current: bool) {
-        let matches = self.search_matches();
+        self.refresh_search_hits();
+        let matches = &self.search_hits;
         let Some(&first) = matches.first() else {
             return;
         };
@@ -699,6 +738,7 @@ fn app_loop(terminal: &mut ratatui::DefaultTerminal, mut app: App) -> io::Result
             .peak_msgs_out
             .max(summary.rates.iter().map(|r| r.msgs_out).max().unwrap_or(0));
 
+        app.refresh_search_hits();
         terminal.draw(|frame| {
             if app.show_splash {
                 draw_splash(frame, &app);
@@ -872,6 +912,7 @@ fn handle_key(app: &mut App, log_h: usize, key: KeyEvent) -> bool {
             app.dropped_events = app.dropped_events.saturating_add(app.events.len());
             app.events.clear();
             app.visible.clear();
+            app.search_hits.clear();
             app.scroll = 0;
         }
         KeyCode::Char('y') => {
@@ -1188,7 +1229,7 @@ fn draw(frame: &mut Frame, app: &App, log_h: usize, metrics: &MetricsSummary) {
         );
     } else if !app.search_text.is_empty() {
         // An active search: show the term and match count with n/N hint.
-        let count = app.search_matches().len();
+        let count = app.search_hits.len();
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled(
@@ -1921,6 +1962,32 @@ mod tests {
             "scroll: {}",
             app.scroll
         );
+    }
+
+    #[test]
+    fn cached_search_hits_track_pushes_trims_and_term_changes() {
+        let mut app = app();
+        app.search_text = "needle".into();
+        app.refresh_search_hits();
+        // Push past the trim threshold so the incremental push and trim paths
+        // both run; the cache must always equal a from-scratch recompute.
+        for i in 0..(HISTORY_CAP + HISTORY_TRIM_CHUNK + 10) {
+            let text = if i % 7 == 0 { "has NEEDLE" } else { "other" };
+            app.push_output(message("Query", text, 40005));
+        }
+        assert!(app.search_hits_current());
+        assert!(!app.search_hits.is_empty());
+        assert_eq!(app.search_hits, app.search_matches());
+
+        // A new term invalidates the cache; refresh recomputes it.
+        app.search_text = "other".into();
+        assert!(!app.search_hits_current());
+        app.refresh_search_hits();
+        assert_eq!(app.search_hits, app.search_matches());
+
+        // Rebuilding `visible` (e.g. a filter change) invalidates it too.
+        app.rebuild_visible();
+        assert!(!app.search_hits_current());
     }
 
     #[test]

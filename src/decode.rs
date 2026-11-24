@@ -351,7 +351,14 @@ pub struct DrainOutcome {
 /// See [`ServerNegotiationWait`] and [`DrainOutcome`] for how the caller learns
 /// about the SSL/GSS negotiation handoff and encryption.
 pub fn drain_direction(dir: &mut Direction, outcome: &mut DrainOutcome) {
-    if outcome.encrypted || dir.dead {
+    if dir.dead {
+        // Desynced beyond recovery: nothing further will decode, so don't let
+        // `rxbuf` accumulate the rest of the connection. Both the pcap `feed`
+        // path and the mitm `pump` append before calling us.
+        dir.rxbuf.clear();
+        return;
+    }
+    if outcome.encrypted {
         return;
     }
     if dir.role == Role::Client {
@@ -480,18 +487,27 @@ fn handle_frontend(
         PgWireFrontendMessage::Parse(p) => {
             // Remember the statement's SQL so later Bind/Execute can show it.
             // Bounded so a connection that churns distinct statement names can't
-            // grow the map without limit.
-            if dir.prepared.len() < PREPARED_CACHE_CAP {
+            // grow the map without limit. Re-parsing an existing name still
+            // updates it at the cap, so Bind/Execute never show stale SQL.
+            let name = p.name.as_deref().unwrap_or("");
+            if dir.prepared.len() < PREPARED_CACHE_CAP || dir.prepared.contains_key(name) {
                 dir.prepared
                     .insert(p.name.clone().unwrap_or_default(), p.query.clone());
             }
             emitter.emit("Parse", &format_parse(&p))
         }
         PgWireFrontendMessage::Bind(b) => {
-            dir.portals.insert(
-                b.portal_name.clone().unwrap_or_default(),
-                b.statement_name.clone().unwrap_or_default(),
-            );
+            // Bounded like `prepared`: a client that Binds fresh portal names
+            // without ever sending Close would otherwise grow this without limit.
+            // Re-binding an existing name (notably the unnamed portal) still
+            // updates its statement at the cap.
+            let portal = b.portal_name.as_deref().unwrap_or("");
+            if dir.portals.len() < PREPARED_CACHE_CAP || dir.portals.contains_key(portal) {
+                dir.portals.insert(
+                    b.portal_name.clone().unwrap_or_default(),
+                    b.statement_name.clone().unwrap_or_default(),
+                );
+            }
             let sql = dir.prepared.get(b.statement_name.as_deref().unwrap_or(""));
             emitter.emit("Bind", &format_bind(&b, sql.map(String::as_str)))
         }
@@ -1193,6 +1209,51 @@ mod tests {
     }
 
     #[test]
+    fn statement_and_portal_caches_are_bounded_but_reusable_at_cap() {
+        use crate::flow::Direction;
+        start_capture();
+        let mut dir = Direction::for_decoding(Role::Client, "127.0.0.1:40000".parse().unwrap());
+        let mut outcome = DrainOutcome::default();
+        let parse = |name: &str, sql: &str| {
+            PgWireFrontendMessage::Parse(Parse::new(Some(name.into()), sql.into(), vec![]))
+        };
+        let bind = |portal: &str, stmt: &str| {
+            PgWireFrontendMessage::Bind(Bind::new(
+                Some(portal.into()),
+                Some(stmt.into()),
+                vec![],
+                vec![],
+                vec![],
+            ))
+        };
+        // The unnamed portal/statement are bound first, then fresh names churn
+        // past the cap without ever being closed.
+        handle_frontend(&mut dir, parse("", "SELECT 0"), &mut outcome, 0);
+        handle_frontend(&mut dir, bind("", ""), &mut outcome, 0);
+        for i in 0..PREPARED_CACHE_CAP + 10 {
+            handle_frontend(
+                &mut dir,
+                parse(&format!("s{i}"), "SELECT 1"),
+                &mut outcome,
+                0,
+            );
+            handle_frontend(&mut dir, bind(&format!("p{i}"), "s0"), &mut outcome, 0);
+        }
+        assert_eq!(dir.prepared.len(), PREPARED_CACHE_CAP);
+        assert_eq!(dir.portals.len(), PREPARED_CACHE_CAP);
+
+        // At the cap, re-Parse of an existing name and re-Bind of an existing
+        // portal still update rather than leaving stale entries.
+        handle_frontend(&mut dir, parse("s0", "SELECT 2"), &mut outcome, 0);
+        handle_frontend(&mut dir, bind("", "s0"), &mut outcome, 0);
+        assert_eq!(dir.prepared.get("s0").map(String::as_str), Some("SELECT 2"));
+        assert_eq!(dir.portals.get("").map(String::as_str), Some("s0"));
+        assert_eq!(dir.prepared.len(), PREPARED_CACHE_CAP);
+        assert_eq!(dir.portals.len(), PREPARED_CACHE_CAP);
+        let _ = take_output_capture();
+    }
+
+    #[test]
     fn printable_payload_preview_is_truncated() {
         let big = Bytes::from(vec![b'x'; 5000]);
         let rendered = format_bytes(&big);
@@ -1212,10 +1273,17 @@ mod tests {
             drain_direction(&mut dir, &mut outcome);
         }
         assert!(dir.dead, "should give up after repeated failures");
-        // Once dead, further drains are a no-op even with fresh bytes.
-        dir.rxbuf.extend_from_slice(&[0xff; 5]);
-        let mut outcome = DrainOutcome::default();
-        drain_direction(&mut dir, &mut outcome);
+        // Once dead, further drains decode nothing and discard what was fed,
+        // so a long-lived desynced connection can't grow `rxbuf` without bound.
+        let segment = [0xffu8; 64 * 1024];
+        for _ in 0..64 {
+            dir.rxbuf.extend_from_slice(&segment);
+            let mut outcome = DrainOutcome::default();
+            drain_direction(&mut dir, &mut outcome);
+            assert_eq!(outcome.msgs, 0);
+            assert!(dir.rxbuf.len() <= segment.len());
+        }
+        assert!(dir.rxbuf.is_empty());
         let _ = take_output_capture();
     }
 

@@ -126,6 +126,11 @@ impl Direction {
     /// SYN consumes one sequence number; data is delivered in order, with
     /// retransmissions de-duplicated and out-of-order segments buffered.
     pub fn feed(&mut self, seq: u32, syn: bool, data: &[u8]) {
+        if self.dead {
+            // Decoding has given up on this direction; buffering (in-order or
+            // out-of-order) would only hold bytes nothing will read.
+            return;
+        }
         if syn {
             // SYN occupies a sequence number; first data byte is seq+1.
             self.next_seq = Some(seq.wrapping_add(1));
