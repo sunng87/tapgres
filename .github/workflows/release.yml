@@ -125,7 +125,7 @@ jobs:
       man: ${{ steps.sha256.outputs.man }}
       source: ${{ steps.sha256.outputs.source }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
