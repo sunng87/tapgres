@@ -57,7 +57,7 @@ jobs:
         # postInstall; copy it out of the nix output as a release asset.
         run: cp result/share/man/man1/tapgres.1.gz tapgres.1.gz
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: tapgres-linux-x86_64
           path: |
@@ -104,7 +104,7 @@ jobs:
       - name: Rename binary
         run: cp "target/${{ matrix.target }}/release/tapgres" "tapgres-${{ matrix.name }}"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: tapgres-${{ matrix.name }}
           path: tapgres-${{ matrix.name }}
